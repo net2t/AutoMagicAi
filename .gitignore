@@ -1,0 +1,42 @@
+# Environment & secrets
+.env
+credentials.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# Output downloads
+downloads/
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# Debug artifacts
+*.html
+magiclight_*.png
+login_*.png
+
+# Playwright browsers (optional, keep if you want cached browsers)
+# .playwright/
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
