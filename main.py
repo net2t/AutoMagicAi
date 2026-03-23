@@ -161,38 +161,46 @@ def clear_cookies():
 # ── Login ─────────────────────────────────────────────────────────────────────
 def login(page, context):
     """
-    Login flow with cookie reuse:
-    1. Load saved cookies → navigate to home → check if already logged in
-    2. If not → do full email/password login → save cookies
+    Old working login flow with cookie saving:
+    1. Try to navigate to login page first
+    2. Check if already logged in
+    3. If not, do full login and save cookies
     """
-    print("[Login] Checking saved cookies...")
-    has_cookies = load_cookies(context)
-
-    page.goto("https://magiclight.ai/home/", timeout=60000)
-    page.wait_for_load_state("domcontentloaded")
-    time.sleep(4)
-
-    # If cookies worked we should NOT be on the login page
-    if "login" not in page.url.lower():
-        print(f"[Login] ✓ Cookie login successful! URL: {page.url}")
-        return
-
-    if has_cookies:
-        print("[Login] Saved cookies were stale — clearing and doing fresh login...")
-        clear_cookies()
-
-    # ── Full login ────────────────────────────────────────────────────────────
     print("[Login] Navigating to login page...")
     page.goto("https://magiclight.ai/login/", timeout=60000)
     page.wait_for_load_state("domcontentloaded")
     time.sleep(4)
 
+    # Already logged in?
+    if "login" not in page.url.lower():
+        print("[Login] Already logged in — skipping.")
+        save_cookies(context)  # Save current session
+        return
+
+    # Load cookies to see if we can bypass login
+    print("[Login] Checking saved cookies...")
+    if load_cookies(context):
+        page.goto("https://magiclight.ai/login/", timeout=60000)
+        page.wait_for_load_state("domcontentloaded")
+        time.sleep(4)
+        
+        if "login" not in page.url.lower():
+            print("[Login] ✓ Cookie login successful!")
+            return
+        else:
+            print("[Login] Cookies stale, proceeding with full login...")
+
+    # Click "Sign in with Email" or "Log in with Email" (a <div class="entry-email">)
     print("[Login] Clicking 'Sign in with Email'...")
     email_entry = None
-    deadline    = time.time() + 15
+    deadline = time.time() + 15
     while time.time() < deadline:
-        for sel in ["div.entry-email", "text='Sign in with Email'",
-                    "text='Log in with Email'", ".login-methods div"]:
+        for sel in [
+            "div.entry-email",
+            "text='Sign in with Email'",
+            "text='Log in with Email'",
+            ".login-methods div"
+        ]:
             try:
                 el = page.locator(sel)
                 if el.count() > 0 and el.first.is_visible():
@@ -203,30 +211,42 @@ def login(page, context):
         if email_entry:
             break
         time.sleep(1)
-
+        
     if email_entry is None:
-        raise Exception("Could not find 'Sign in with Email' on login page.")
-    email_entry.click()
+        raise Exception("Could not find 'Sign in with Email' option on login page.")
+        
+    try:
+        email_entry.click()
+    except Exception:
+        email_entry.first.click()
     time.sleep(3)
 
-    print("[Login] Filling credentials...")
+    # Fill Email (input type="text" on this site)
+    print("[Login] Filling email...")
     email_input = page.locator('input[type="text"], input[type="email"]')
     email_input.first.wait_for(state="visible", timeout=10000)
+    email_input.first.click()
     email_input.first.fill(ML_EMAIL)
     time.sleep(0.5)
 
+    # Fill Password
+    print("[Login] Filling password...")
     pwd_input = page.locator('input[type="password"]')
     pwd_input.first.wait_for(state="visible", timeout=10000)
+    pwd_input.first.click()
     pwd_input.first.fill(ML_PASSWORD)
     time.sleep(0.5)
 
-    print("[Login] Clicking Continue...")
-    cont = page.locator("div.signin-continue")
-    if cont.count() == 0:
-        cont = page.locator("text='Continue'")
-    cont.first.wait_for(state="visible", timeout=10000)
-    cont.first.click()
+    # Click Continue — it's a <div class="signin-continue">, NOT a <button>
+    print("[Login] Clicking Continue (div.signin-continue)...")
+    continue_el = page.locator("div.signin-continue")
+    if continue_el.count() == 0:
+        # broad fallback
+        continue_el = page.locator("text='Continue'")
+    continue_el.first.wait_for(state="visible", timeout=10000)
+    continue_el.first.click()
 
+    # Wait for redirect away from login
     print("[Login] Waiting for dashboard...")
     try:
         page.wait_for_url("**/home**", timeout=30000)
@@ -234,9 +254,9 @@ def login(page, context):
         time.sleep(8)
 
     if "login" in page.url.lower():
-        raise Exception("Login failed — still on login page after Continue.")
+        raise Exception("Login failed — still on login page after clicking Continue.")
 
-    print(f"[Login] ✓ Logged in! URL: {page.url}")
+    print(f"[Login] ✓ Success! URL: {page.url}")
     save_cookies(context)   # Save cookies for next run
 
 
