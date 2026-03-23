@@ -7,6 +7,7 @@ Repo: https://github.com/net2t/AutoMagicAi
 import os
 import sys
 import time
+import signal
 import argparse
 import requests
 import gspread
@@ -19,6 +20,10 @@ from dotenv import load_dotenv
 
 # ── Load config from .env ─────────────────────────────────────────────────────
 load_dotenv()
+
+# Global variables for graceful shutdown
+shutdown_requested = False
+browser_instance = None
 
 SPREADSHEET_ID  = os.getenv("SPREADSHEET_ID", "")
 ML_EMAIL        = os.getenv("ML_EMAIL", "")
@@ -42,6 +47,26 @@ COL_YOUTUBE   = 10
 COL_THUMB_URL = 11
 COL_VIDEO_URL = 12
 COL_NOTES     = 13
+
+# ── Graceful Shutdown Handler ───────────────────────────────────────────────────
+def signal_handler(signum, frame):
+    """Handle CTRL+C signal gracefully."""
+    global shutdown_requested, browser_instance
+    print("\n\n[GRACEFUL SHUTDOWN] CTRL+C detected. Cleaning up...")
+    shutdown_requested = True
+    
+    if browser_instance:
+        print("[GRACEFUL SHUTDOWN] Closing browser...")
+        try:
+            browser_instance.close()
+        except Exception as e:
+            print(f"[GRACEFUL SHUTDOWN] Error closing browser: {e}")
+    
+    print("[GRACEFUL SHUTDOWN] Cleanup complete. Exiting...")
+    sys.exit(0)
+
+# Register the signal handler
+signal.signal(signal.SIGINT, signal_handler)
 
 # ── CLI Arguments ─────────────────────────────────────────────────────────────
 def parse_args():
@@ -846,6 +871,7 @@ def main():
             headless=args.headless,
             args=["--start-maximized"],
         )
+        browser_instance = browser  # Store for graceful shutdown
         context = browser.new_context(
             accept_downloads=True,
             no_viewport=True,
@@ -863,6 +889,11 @@ def main():
         processed = 0
 
         for idx, row in enumerate(records, start=2):
+            # Check for graceful shutdown request
+            if shutdown_requested:
+                print(f"\n[SHUTDOWN] Graceful shutdown requested. Stopping after {processed} stories.")
+                break
+                
             if processed >= limit:
                 print(f"\n[Limit] Reached {limit} stories. Stopping.")
                 break
@@ -885,6 +916,11 @@ def main():
             print(f"\n{'='*60}")
             print(f"[Processing] Row {idx}: {title_hint}")
             print(f"{'='*60}")
+
+            # Check for shutdown before starting story processing
+            if shutdown_requested:
+                print(f"[SHUTDOWN] Graceful shutdown requested before processing row {idx}.")
+                break
 
             try:
                 # Run the full generation pipeline
@@ -935,8 +971,12 @@ def main():
         print(f"\n{'='*60}")
         print(f"  Done! Processed {processed}/{limit} stories.")
         print(f"{'='*60}")
-        input("Press Enter to close the browser...")
+        
+        if not shutdown_requested:
+            input("Press Enter to close the browser...")
+        
         browser.close()
+        browser_instance = None  # Clear the reference
 
 
 if __name__ == "__main__":
