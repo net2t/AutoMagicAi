@@ -803,7 +803,10 @@ def main():
     sheet = get_sheet()
     if not sheet:
         return
-    records = sheet.get_all_records()
+    records = sheet.get_all_records(expected_headers=[
+        "Theme", "Title", "Story Text", "Moral", "Hashtags", "Date&Time", "Status",
+        "MagicThumbnail", "VideoID", "Generated Title", "Summary", "Generated Hashtags", "Notes", "ProjectURL"
+    ])
     print(f"[Setup] Found {len(records)} rows in sheet.")
 
     drive_service = None
