@@ -1,6 +1,7 @@
 # Environment & secrets
 .env
 credentials.json
+cookies.json
 
 # Python cache
 __pycache__/
@@ -27,9 +28,6 @@ downloads/
 *.html
 magiclight_*.png
 login_*.png
-
-# Playwright browsers (optional, keep if you want cached browsers)
-# .playwright/
 
 # IDE
 .vscode/

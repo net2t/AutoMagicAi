@@ -1,33 +1,49 @@
 # AutoMagicAI 🎬
 
-Automates AI video generation on [MagicLight.AI](https://magiclight.ai) — reads stories from a Google Sheet, generates **Kids Story Videos**, downloads the video & thumbnail, uploads them to **Google Drive**, and writes results back to the sheet.
+Automates AI video generation on [MagicLight.AI](https://magiclight.ai) — reads stories from a Google Sheet, generates **Kids Story Videos**, downloads the video & thumbnail, uploads them to **Google Drive**, and writes all results back to the sheet.
 
 ---
 
 ## Features
 
+- ✅ Cookie-based login (logs in once, reuses session on next runs)
 - ✅ Reads stories from a Google Sheet
-- ✅ Logs in to MagicLight.AI automatically
+- ✅ Skips rows already marked **Generated**
+- ✅ Saves the **Project URL** to the sheet right after Step 1 (for retry)
+- ✅ Automatically retries using saved Project URL if a row is marked **Pending**
 - ✅ Navigates the full 4-step Kids Story generation flow
 - ✅ Selects: Pixar 2.0 style · 16:9 ratio · 1 min · English · GPT-4 · Ethan voice
-- ✅ Waits for video render (up to 10 min per story)
-- ✅ Downloads video + magic thumbnail
-- ✅ Uploads both to Google Drive (per-story subfolder)
-- ✅ Updates Google Sheet: Status, Video ID, URLs, Notes, Hashtags
-- ✅ Configurable via `.env` — no code changes needed
+- ✅ Waits for video render (configurable — default 15 min)
+- ✅ Downloads **video** + **Magic Thumbnail** into a named local folder
+- ✅ Uploads both to **Google Drive** (per-story subfolder, same name)
+- ✅ Updates Google Sheet: Status, Magic Thumbnail URL, Video ID, Generated Title, Summary, Hashtags, Notes, Project URL
+- ✅ All timeouts configurable via `.env` — no code changes needed
+- ✅ Graceful CTRL+C shutdown
 
 ---
 
-## Google Sheet Format
+## Google Sheet Column Structure
 
-The script expects a sheet with the following **column headers** in row 1:
+| Col | Header | Description |
+|-----|--------|-------------|
+| A | Theme | Story theme/category |
+| B | Title | Story title |
+| C | Story Text | Full story content |
+| D | Moral | Moral of the story |
+| E | Hashtags | Input hashtags |
+| F | Date & Time | Submission date |
+| G | Status | `Pending` → `Generated` or `Error` |
+| H | Magic Thumbnail | Drive URL of the thumbnail |
+| I | VideoID | MagicLight project ID |
+| J | Title | AI-generated title |
+| K | Summary | AI-generated summary |
+| L | Hashtags | AI-generated hashtags |
+| M | Notes | Processing notes |
+| N | Project URL | MagicLight edit URL (for retries) |
 
-| A | B | C | D | E | F | G | H | I | J | K | L | M |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Theme | Title | Story Text | Moral | Hashtags | Date & Time | Status | Word Count | Video ID | YouTube URL | Drive Thumbnail URL | Drive Video URL | Notes |
-
-- The script skips rows where **Status = "Generated"**
-- Rows with empty **Story Text** are also skipped
+- Rows where **Status = "Generated"** are **skipped**
+- Rows with empty **Story Text** are **skipped**
+- Rows with a **Project URL** and **Status ≠ Generated** are treated as retry jobs
 
 ---
 
@@ -40,59 +56,96 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 2. Google Service Account (for Sheets + Drive access)
+### 2. Google Service Account (Sheets + Drive access)
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
 2. Create a project → Enable **Google Sheets API** and **Google Drive API**
-3. Create a **Service Account** → Download the JSON key → Save as `credentials.json` in this folder
-4. Share your Google Sheet and Google Drive folder with the service account email (found inside `credentials.json` under `client_email`)
+3. Create a **Service Account** → Download JSON key → Save as `credentials.json`
+4. Share your Google Sheet and Drive folder with the service account email
 
 ### 3. Configure `.env`
 
-Copy `.env` and fill in your values:
+Copy `.env.example` to `.env` and fill in your values:
 
 ```ini
-SPREADSHEET_ID=your_spreadsheet_id_here
 ML_EMAIL=your_magiclight_email@example.com
 ML_PASSWORD=your_magiclight_password
-STORIES_PER_RUN=2
+SPREADSHEET_ID=your_spreadsheet_id_here
 GOOGLE_DRIVE_FOLDER_ID=your_google_drive_folder_id_here
-```
+STORIES_PER_RUN=2
 
-**Where to find IDs:**
-- **SPREADSHEET_ID** → The long ID in your Google Sheet URL
-- **GOOGLE_DRIVE_FOLDER_ID** → ID at the end of your Google Drive folder URL  
-  e.g. `https://drive.google.com/drive/folders/1Abc2Def3Ghi` → ID is `1Abc2Def3Ghi`
+# Timing controls (seconds) — increase if your connection is slow
+STEP1_WAIT=60
+STEP2_WAIT=20
+STEP3_WAIT=180
+STEP4_RENDER_TIMEOUT=900
+STEP4_POLL_INTERVAL=15
+STEP4_MAX_NEXT=10
+```
 
 ---
 
 ## Usage
 
 ```bash
+# Normal run (uses STORIES_PER_RUN from .env)
 python main.py
+
+# Process only 1 story
+python main.py --maxstory 1
+
+# Run headless (no browser window)
+python main.py --headless
 ```
-
-A Chromium browser window will open. The script will:
-1. Log in to MagicLight.AI
-2. Process up to `STORIES_PER_RUN` stories from the sheet
-3. Generate videos, download them, and upload to Drive
-4. Update the sheet with results
-
-> **Credit usage**: Each story generation costs ~60–100 credits on MagicLight.AI.
 
 ---
 
-## File Structure
+## Cookie Login
+
+On the **first run**, the script logs in with your email/password and saves a `cookies.json` file.  
+On **every subsequent run**, it loads the saved cookies — no password entry needed.  
+If cookies expire, the script detects this automatically, clears the file, and logs in fresh.
+
+---
+
+## Retry Logic
+
+If a story fails mid-way (e.g., render timeout), the script:
+1. Saves the **Project URL** (e.g. `https://magiclight.ai/project/edit/123...`) to column N
+2. Marks Status as **Pending**
+
+On the next run, it detects the saved URL and jumps **directly to Step 4** — skipping Steps 1–3, saving time and credits.
+
+---
+
+## Local File Structure
+
+Each story creates a named subfolder inside `downloads/`:
+
+```
+downloads/
+└── Row_2_Luna_and_the_Lantern_of_New_Lights/
+    ├── Row_2_Luna_and_the_Lantern_of_New_Lights_thumbnail.jpg
+    └── Row_2_Luna_and_the_Lantern_of_New_Lights.mp4
+```
+
+The same folder structure is mirrored in Google Drive.
+
+---
+
+## Project Files
 
 ```
 AutoMagicAI/
 ├── main.py              # Main automation script
 ├── credentials.json     # Google Service Account key (DO NOT commit)
-├── .env                 # Configuration (DO NOT commit)
+├── .env                 # Your configuration (DO NOT commit)
+├── .env.example         # Template for .env
+├── cookies.json         # Saved login cookies (auto-created, DO NOT commit)
 ├── .gitignore
 ├── requirements.txt
 ├── README.md
-└── downloads/           # Temporary download folder (created at runtime)
+└── downloads/           # Video + thumbnail downloads (auto-created)
 ```
 
 ---
