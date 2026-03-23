@@ -159,13 +159,7 @@ def clear_cookies():
 
 
 # ── Login ─────────────────────────────────────────────────────────────────────
-def login(page, context):
-    """
-    Old working login flow with cookie saving:
-    1. Try to navigate to login page first
-    2. Check if already logged in
-    3. If not, do full login and save cookies
-    """
+def login(page):
     print("[Login] Navigating to login page...")
     page.goto("https://magiclight.ai/login/", timeout=60000)
     page.wait_for_load_state("domcontentloaded")
@@ -174,21 +168,7 @@ def login(page, context):
     # Already logged in?
     if "login" not in page.url.lower():
         print("[Login] Already logged in — skipping.")
-        save_cookies(context)  # Save current session
         return
-
-    # Load cookies to see if we can bypass login
-    print("[Login] Checking saved cookies...")
-    if load_cookies(context):
-        page.goto("https://magiclight.ai/login/", timeout=60000)
-        page.wait_for_load_state("domcontentloaded")
-        time.sleep(4)
-        
-        if "login" not in page.url.lower():
-            print("[Login] ✓ Cookie login successful!")
-            return
-        else:
-            print("[Login] Cookies stale, proceeding with full login...")
 
     # Click "Sign in with Email" or "Log in with Email" (a <div class="entry-email">)
     print("[Login] Clicking 'Sign in with Email'...")
@@ -257,7 +237,6 @@ def login(page, context):
         raise Exception("Login failed — still on login page after clicking Continue.")
 
     print(f"[Login] ✓ Success! URL: {page.url}")
-    save_cookies(context)   # Save cookies for next run
 
 
 # ── Popup / tour helpers ──────────────────────────────────────────────────────
@@ -860,7 +839,7 @@ def main():
         page    = context.new_page()
 
         try:
-            login(page, context)
+            login(page)
         except Exception as e:
             print(f"[FATAL] Login failed: {e}")
             browser.close()
