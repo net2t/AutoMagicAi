@@ -898,7 +898,7 @@ def main():
                 print(f"\n[Limit] Reached {limit} stories. Stopping.")
                 break
 
-            if row.get("Status", "").strip().lower() == "generated":
+            if row.get("Status", "").strip().lower() != "generated":
                 continue
 
             story = row.get("Story Text", "").strip()
