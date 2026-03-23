@@ -5,7 +5,9 @@ Repo: https://github.com/net2t/AutoMagicAi
 """
 
 import os
+import sys
 import time
+import argparse
 import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -15,32 +17,48 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from dotenv import load_dotenv
 
-# ── Load config from .env ────────────────────────────────────────────────────
+# ── Load config from .env ─────────────────────────────────────────────────────
 load_dotenv()
 
-SPREADSHEET_ID     = os.getenv("SPREADSHEET_ID", "")
-ML_EMAIL           = os.getenv("ML_EMAIL", "")
-ML_PASSWORD        = os.getenv("ML_PASSWORD", "")
-STORIES_PER_RUN    = int(os.getenv("STORIES_PER_RUN", "2"))
-DRIVE_FOLDER_ID    = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
-CREDS_FILE         = "credentials.json"
-DOWNLOADS_DIR      = os.path.join(os.path.dirname(__file__), "downloads")
+SPREADSHEET_ID  = os.getenv("SPREADSHEET_ID", "")
+ML_EMAIL        = os.getenv("ML_EMAIL", "")
+ML_PASSWORD     = os.getenv("ML_PASSWORD", "")
+STORIES_PER_RUN = int(os.getenv("STORIES_PER_RUN", "2"))
+DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
+CREDS_FILE      = "credentials.json"
+DOWNLOADS_DIR   = os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# ── Google API Scopes ────────────────────────────────────────────────────────
+# Google API scopes
 SHEETS_SCOPES = ["https://spreadsheets.google.com/feeds",
                   "https://www.googleapis.com/auth/drive"]
 DRIVE_SCOPES  = ["https://www.googleapis.com/auth/drive"]
 
-# Column indices (1-based) matching the sheet headers:
-# Theme | Title | Story Text | Moral | Hashtags | Date&Time | Status |
-# Word Count | Video ID | YouTube URL | Drive Thumbnail URL | Drive Video URL | Notes
-COL_STATUS          = 7
-COL_VIDEO_ID        = 9
-COL_YOUTUBE_URL     = 10
-COL_THUMB_URL       = 11
-COL_VIDEO_URL       = 12
-COL_NOTES           = 13
+# Sheet column indices (1-based):
+# Theme|Title|Story Text|Moral|Hashtags|Date&Time|Status|WordCount|VideoID|YouTubeURL|DriveThumbURL|DriveVideoURL|Notes
+COL_STATUS    = 7
+COL_VIDEO_ID  = 9
+COL_YOUTUBE   = 10
+COL_THUMB_URL = 11
+COL_VIDEO_URL = 12
+COL_NOTES     = 13
+
+# ── CLI Arguments ─────────────────────────────────────────────────────────────
+def parse_args():
+    parser = argparse.ArgumentParser(description="AutoMagicAI — Kids Story video generator")
+    parser.add_argument(
+        "--maxstory", "-n",
+        type=int,
+        default=None,
+        help="Number of stories to process in this run (overrides .env STORIES_PER_RUN)"
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        default=False,
+        help="Run browser in headless mode (no visible window)"
+    )
+    return parser.parse_args()
 
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
@@ -61,7 +79,6 @@ def get_drive_service():
 
 
 def create_drive_folder(service, name: str, parent_id: str) -> str:
-    """Create a subfolder inside parent_id and return its ID."""
     metadata = {
         "name": name,
         "mimeType": "application/vnd.google-apps.folder",
@@ -72,7 +89,6 @@ def create_drive_folder(service, name: str, parent_id: str) -> str:
 
 
 def upload_to_drive(service, local_path: str, folder_id: str) -> str:
-    """Upload a file to Drive and return a shareable link."""
     name = os.path.basename(local_path)
     mime = "video/mp4" if local_path.endswith(".mp4") else "image/jpeg"
     media = MediaFileUpload(local_path, mimetype=mime, resumable=True)
@@ -80,7 +96,6 @@ def upload_to_drive(service, local_path: str, folder_id: str) -> str:
     uploaded = service.files().create(
         body=file_meta, media_body=media, fields="id, webViewLink"
     ).execute()
-    # Make publicly readable
     service.permissions().create(
         fileId=uploaded["id"],
         body={"role": "reader", "type": "anyone"},
@@ -92,6 +107,7 @@ def upload_to_drive(service, local_path: str, folder_id: str) -> str:
 def login(page):
     print("[Login] Navigating to login page...")
     page.goto("https://magiclight.ai/login/", timeout=60000)
+    page.wait_for_load_state("domcontentloaded")
     time.sleep(4)
 
     # Already logged in?
@@ -99,63 +115,86 @@ def login(page):
         print("[Login] Already logged in — skipping.")
         return
 
-    # Step 1: click "Log in with Email"
-    email_option = page.locator("text='Log in with Email'")
-    if email_option.count() > 0:
-        print("[Login] Clicking 'Log in with Email'...")
-        email_option.first.click()
-        time.sleep(3)
+    # Click "Sign in with Email" or "Log in with Email" (a <div class="entry-email">)
+    print("[Login] Clicking 'Sign in with Email'...")
+    email_entry = None
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        for sel in [
+            "div.entry-email",
+            "text='Sign in with Email'",
+            "text='Log in with Email'",
+            ".login-methods div"
+        ]:
+            try:
+                el = page.locator(sel)
+                if el.count() > 0 and el.first.is_visible():
+                    email_entry = el.first
+                    break
+            except Exception:
+                pass
+        if email_entry:
+            break
+        time.sleep(1)
+        
+    if email_entry is None:
+        raise Exception("Could not find 'Sign in with Email' option on login page.")
+        
+    try:
+        email_entry.click()
+    except Exception:
+        email_entry.first.click()
+    time.sleep(3)
 
-    # Step 2: fill email (field is type="text" on this site)
+    # Fill Email (input type="text" on this site)
     print("[Login] Filling email...")
     email_input = page.locator('input[type="text"], input[type="email"]')
     email_input.first.wait_for(state="visible", timeout=10000)
+    email_input.first.click()
     email_input.first.fill(ML_EMAIL)
     time.sleep(0.5)
 
-    # Step 3: fill password
+    # Fill Password
     print("[Login] Filling password...")
     pwd_input = page.locator('input[type="password"]')
     pwd_input.first.wait_for(state="visible", timeout=10000)
+    pwd_input.first.click()
     pwd_input.first.fill(ML_PASSWORD)
     time.sleep(0.5)
 
-    # Step 4: click the "Continue" button (gradient button visible in screenshot)
-    print("[Login] Clicking Continue button...")
-    continue_btn = page.locator("button:has-text('Continue')")
-    if continue_btn.count() == 0:
-        continue_btn = page.locator("button").filter(has_text="Continue")
-    continue_btn.first.wait_for(state="visible", timeout=10000)
-    continue_btn.first.click()
+    # Click Continue — it's a <div class="signin-continue">, NOT a <button>
+    print("[Login] Clicking Continue (div.signin-continue)...")
+    continue_el = page.locator("div.signin-continue")
+    if continue_el.count() == 0:
+        # broad fallback
+        continue_el = page.locator("text='Continue'")
+    continue_el.first.wait_for(state="visible", timeout=10000)
+    continue_el.first.click()
 
-    # Step 5: wait for dashboard to load
+    # Wait for redirect away from login
     print("[Login] Waiting for dashboard...")
     try:
-        page.wait_for_url("**/home/**", timeout=30000)
+        page.wait_for_url("**/home**", timeout=30000)
     except Exception:
-        try:
-            page.wait_for_url("**/dashboard**", timeout=10000)
-        except Exception:
-            pass
-    time.sleep(3)
+        time.sleep(8)
 
     if "login" in page.url.lower():
-        raise Exception("Login failed — still on login page after Continue click.")
+        raise Exception("Login failed — still on login page after clicking Continue.")
 
-    print(f"[Login] Success! Current URL: {page.url}")
+    print(f"[Login] ✓ Success! URL: {page.url}")
 
 
-# ── Dismiss any popups / modals ───────────────────────────────────────────────
+# ── Utility ───────────────────────────────────────────────────────────────────
 def dismiss_popups(page):
-    time.sleep(1)
+    """Silently close any modal/popup that might be in the way."""
     for selector in [
+        ".arco-modal-close-btn",
         "button:has-text('OK')",
         "button:has-text('Got it')",
         "button:has-text('Close')",
-        ".arco-modal-close-btn",
-        ".sora2-modal .close",
         "[aria-label='Close']",
-        "button:has-text('×')",
+        ".sora2-modal .close",
+        ".notice-popup-modal__close",
     ]:
         try:
             btn = page.locator(selector)
@@ -166,311 +205,586 @@ def dismiss_popups(page):
             pass
 
 
-# ── Step 1: Content — fill story and settings ─────────────────────────────────
+def _dismiss_animation_modal(page):
+    """Dismiss the 'Animate All' suggestion modal that appears after each Next click.
+    Clicks the secondary 'Next' button (arco-btn-secondary) inside the modal to skip animation."""
+    js = """
+    () => {
+        // The animation modal dismiss button is BUTTON.arco-btn-secondary with text 'Next' or 'Skip'
+        const btns = Array.from(document.querySelectorAll('button.arco-btn-secondary, .arco-modal-footer button'));
+        for (const el of btns) {
+            const t = (el.innerText || '').trim();
+            const rect = el.getBoundingClientRect();
+            if ((t === 'Next' || t === 'Skip') && rect.width > 0 && rect.height > 0) {
+                el.click();
+                return 'Dismissed modal via arco-btn-secondary: ' + t;
+            }
+        }
+        return null;
+    }
+    """
+    try:
+        result = page.evaluate(js)
+        if result:
+            print(f"[Modal] ✓ {result}")
+            time.sleep(2)
+    except Exception:
+        pass
+
+
+def _click_next(page, timeout=20000):
+    """Robustly click any 'Next' button visible on the current page."""
+    # Specific selector to avoid the 'Next' button *inside* the tutorial popup 
+    # (assuming tutorial is dismissed, but this provides extra safety)
+    selectors = [
+        "button.arco-btn-primary:has-text('Next')",
+        "button:has-text('Next')",
+        "div.page-footer button",
+        "[class*='next-btn']",
+        "div:has-text('Next') >> visible=true",
+        "span:has-text('Next')",
+    ]
+    deadline = time.time() + timeout / 1000
+    while time.time() < deadline:
+        for sel in selectors:
+            try:
+                btn = page.locator(sel).last  # Use last() to target the main page button, usually at the bottom
+                if btn.is_visible():
+                    btn.click()
+                    time.sleep(3)
+                    return
+            except Exception:
+                pass
+        time.sleep(2)
+    raise Exception("Could not find a clickable Next button")
+
+
+def _set_dropdown_value(page, label_text: str, value_text: str):
+    """Find a labeled dropdown and select a value from it."""
+    try:
+        # Find the label, then locate the associated select/dropdown container
+        label = page.locator(f"text='{label_text}'").first
+        if not label.is_visible():
+            return
+        # Click the closest arco-select
+        container = page.locator(f"text='{label_text}' >> xpath=following-sibling::*[1]//div[contains(@class,'select')]")
+        if container.count() > 0:
+            container.first.click()
+            time.sleep(1)
+            option = page.locator(f".arco-select-dropdown li:has-text('{value_text}'), li:has-text('{value_text}')")
+            if option.count() > 0 and option.first.is_visible():
+                option.first.click()
+                time.sleep(0.5)
+    except Exception:
+        pass
+
+
+# ── Step 1: Content ───────────────────────────────────────────────────────────
+def _dismiss_tour(page):
+    """Dismiss the on-boarding tour overlay (diy-tour) if present via JS."""
+    try:
+        # Wait a moment for any tours to pop up
+        time.sleep(3)
+        print("[Tour] Checking for tutorial overlays...")
+        
+        # 1. Use JS to natively click any button/span/div with exact text "Skip", "Got it", or "Close"
+        # We run it a few times in case the tour has multiple steps (e.g., 1/2 -> 2/2)
+        js_click = """
+        () => {
+            const texts = ["Skip", "Got it", "Got It", "Close", "Done"];
+            document.querySelectorAll('button, span, div, a').forEach(el => {
+                if (el.innerText && texts.includes(el.innerText.trim())) {
+                    el.click();
+                }
+            });
+        }
+        """
+        for _ in range(3):
+            page.evaluate(js_click)
+            time.sleep(1)
+            
+        # 2. Force remove the tour DOM elements just in case they're still blocking
+        js_remove = """
+        () => {
+            document.querySelectorAll('.diy-tour, .diy-tour__mask, [class*="tour-tooltip"], [class*="driver-"]').forEach(el => {
+                try { el.remove(); } catch(e) {}
+            });
+        }
+        """
+        page.evaluate(js_remove)
+        time.sleep(1)
+        
+    except Exception as e:
+        print(f"[Tour] Error during tour dismissal: {e}")
+
+
+# ── Step 1: Content ───────────────────────────────────────────────────────────
 def step1_content(page, story_text: str):
     print("[Step 1] Navigating to Kids Story page...")
     page.goto("https://magiclight.ai/kids-story/", timeout=60000)
     page.wait_for_load_state("domcontentloaded")
-    time.sleep(5)
+    time.sleep(6)
     dismiss_popups(page)
+    _dismiss_tour(page)
 
-    # Story Topic textarea
-    print("[Step 1] Entering story text...")
+    # Paste story into the Story Topic textarea
+    print("[Step 1] Pasting story text...")
     textarea = page.locator("textarea[placeholder*='original story']")
     textarea.wait_for(state="visible", timeout=20000)
-    textarea.fill(story_text)
+
+    # Use JS fill to bypass any remaining overlay / z-index issues
+    textarea.first.evaluate(f"el => {{ el.value = {repr(story_text)}; el.dispatchEvent(new Event('input', {{bubbles:true}})); }}")
     time.sleep(1)
 
     # Style: Pixar 2.0
     print("[Step 1] Selecting Pixar 2.0 style...")
     try:
-        pixar_option = page.locator("text='Pixar 2.0'")
-        if pixar_option.count() > 0:
-            pixar_option.first.click()
+        pixar = page.locator("text='Pixar 2.0'")
+        if pixar.count() > 0 and pixar.first.is_visible():
+            pixar.first.click()
             time.sleep(1)
     except Exception:
-        print("[Step 1] Pixar 2.0 not found, using default style")
+        print("[Step 1] Pixar 2.0 not clickable, skipping")
 
-    # Aspect Ratio: 16:9 (default, but explicitly set)
+    # Aspect Ratio: 16:9 (click to ensure it's selected)
     try:
-        ratio_btn = page.locator("button:has-text('16:9'), div:has-text('16:9')").first
-        if ratio_btn.is_visible():
-            ratio_btn.click()
-            time.sleep(0.5)
-    except Exception:
-        pass
-
-    # Video Duration: 1min (default)
-    # Language: English (default)
-    # Story Model: GPT-4, Voiceover: Ethan, Background Music: Rosita
-    # These are usually dropdowns — try to set them:
-    try:
-        _set_dropdown(page, "Story Model", "GPT-4")
-    except Exception:
-        pass
-    try:
-        _set_dropdown(page, "Voiceover", "Ethan")
-    except Exception:
-        pass
-    try:
-        _set_dropdown(page, "Background Music", "Rosita")
+        r169 = page.locator("text='16:9'")
+        if r169.count() > 0 and r169.first.is_visible():
+            r169.first.click()
     except Exception:
         pass
 
-    # Click Next
+    # Dropdowns: Video Duration=1min, Language=English, Story Model=GPT-4, Voiceover=Ethan, BGM=Rosita
+    # These are already the defaults — only change if they appear non-default
+    # (skip silent failures to avoid breaking the flow)
+    _set_dropdown_value(page, "Video Duration", "1min")
+    _set_dropdown_value(page, "Language", "English")
+    _set_dropdown_value(page, "Story Model", "GPT-4")
+    _set_dropdown_value(page, "Voiceover", "Ethan")
+    _set_dropdown_value(page, "Background Music", "Rosita")
+
+    time.sleep(1)
+
+    # Scroll down to make Next visible and click it
     print("[Step 1] Clicking Next...")
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    time.sleep(1)
     _click_next(page)
 
 
-def _set_dropdown(page, label: str, value: str):
-    """Find a dropdown by its visible label text and select a value."""
-    label_el = page.locator(f"text='{label}'").first
-    if label_el.is_visible():
-        # Click on the dropdown arrow/container near the label
-        parent = label_el.locator("xpath=ancestor::*[contains(@class,'select') or contains(@class,'dropdown')][1]")
-        if parent.count() > 0:
-            parent.first.click()
-            time.sleep(1)
-            option = page.locator(f"text='{value}'")
-            if option.count() > 0 and option.first.is_visible():
-                option.first.click()
-                time.sleep(0.5)
+# ── Step 2: Cast ──────────────────────────────────────────────────────────────
+def _dom_click_text(page, texts: list, timeout: int = 120) -> bool:
+    """Click the last visible button-like element whose DIRECT text node matches any of 'texts'.
+    Uses firstChild.textContent to avoid matching credit-badge children like 'Next Step\\n60'.
+    Returns True if clicked, False if timed out."""
+    js = """
+    (texts) => {
+        const all = Array.from(document.querySelectorAll(
+            'button, div[class*="btn"], span[class*="btn"], a, div[class*="vlog-btn"], div[class*="footer-btn"]'
+        ));
+        // Iterate in reverse so the bottom-most (primary action) element wins
+        for (let i = all.length - 1; i >= 0; i--) {
+            const el = all[i];
+            // Use direct text node only (not innerText) to avoid child badge text
+            let directText = '';
+            el.childNodes.forEach(n => {
+                if (n.nodeType === Node.TEXT_NODE) directText += n.textContent;
+            });
+            directText = directText.trim();
+            // Fallback to innerText if no direct text node
+            const fullText = (el.innerText || '').trim();
+            const t = directText || fullText;
+            if (texts.includes(t)) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    el.click();
+                    return t;
+                }
+            }
+        }
+        return null;
+    }
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = page.evaluate(js, texts)
+        if result:
+            print(f"[DOM] ✓ Clicked '{result}'")
+            return True
+        time.sleep(3)
+    return False
 
 
-def _click_next(page):
-    """Click the Next or Next Step button, retrying if needed."""
-    for attempt in range(5):
-        for sel in [
-            "button:has-text('Next')",
-            "div.page-footer button:has-text('Next')",
-            "[class*='next-btn']",
-            "span:has-text('Next')",
-        ]:
-            btn = page.locator(sel)
-            if btn.count() > 0 and btn.first.is_visible():
-                try:
-                    btn.first.click(timeout=5000)
-                    time.sleep(3)
-                    return
-                except Exception:
-                    pass
-        time.sleep(2)
-    raise Exception("Could not find or click the Next button")
+def _dom_click_class(page, css_class: str, timeout: int = 30) -> bool:
+    """Click a visible element by exact CSS class substring. More reliable when text contains child nodes."""
+    js = f"""
+    () => {{
+        const all = Array.from(document.querySelectorAll('[class*="{css_class}"]'));
+        for (let i = all.length - 1; i >= 0; i--) {{
+            const el = all[i];
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {{
+                el.click();
+                return el.className;
+            }}
+        }}
+        return null;
+    }}
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = page.evaluate(js)
+        if result:
+            print(f"[DOM] ✓ Clicked class ~'{css_class}' -> '{result}'")
+            return True
+        time.sleep(3)
+    return False
 
 
-# ── Step 2: Cast — auto-selected, just click Next Step ───────────────────────
+def _dom_debug_buttons(page):
+    """Print all visible clickable elements for debugging."""
+    js = """
+    () => {
+        const all = Array.from(document.querySelectorAll(
+            'button, div[class*="btn"], span[class*="btn"], a, div[class*="vlog-btn"]'
+        ));
+        const results = [];
+        all.forEach(el => {
+            const t = (el.innerText || '').trim().substring(0, 60);
+            const rect = el.getBoundingClientRect();
+            if (t && rect.width > 0 && rect.height > 0) {
+                results.push(el.tagName + '.' + (el.className||'').substring(0,40) + ' | ' + t);
+            }
+        });
+        return results;
+    }
+    """
+    try:
+        items = page.evaluate(js)
+        print(f"[DEBUG] URL: {page.url}")
+        print(f"[DEBUG] Visible buttons/links:")
+        for item in (items or []):
+            print(f"  {item}")
+    except Exception as e:
+        print(f"[DEBUG] Could not dump buttons: {e}")
+
+
 def step2_cast(page):
-    print("[Step 2] Cast — waiting for characters to load...")
-    time.sleep(8)
+    print("[Step 2] Cast — waiting for characters to analyze and generate...")
+    time.sleep(10)
     dismiss_popups(page)
 
-    # Click "Next Step" (costs ~60 credits)
-    print("[Step 2] Clicking Next Step...")
-    next_step_btn = page.locator("button:has-text('Next Step')")
-    next_step_btn.wait_for(state="visible", timeout=30000)
-    next_step_btn.first.click()
-    time.sleep(5)
+    # Primary: Click 'Next Step' by class (step2-footer-btn-left)
+    # (innerText is 'Next Step\n60' due to credits badge child, so class-based is more reliable)
+    print("[Step 2] Clicking Next Step via class (step2-footer-btn-left)...")
+    if _dom_click_class(page, "step2-footer-btn-left", timeout=120):
+        print("[Step 2] ✓ Done.")
+    else:
+        # Fallback: try text-based
+        if _dom_click_text(page, ["Next Step", "Animate All", "Create now"], timeout=30):
+            print("[Step 2] ✓ Done (fallback text match).")
+        else:
+            _dom_debug_buttons(page)
+            print("[Step 2] Could not find Next Step button — assuming auto-skipped.")
+    time.sleep(4)
+    _dismiss_animation_modal(page)  # Dismiss animation suggestion modal
+    time.sleep(4)
 
 
-# ── Step 3: Storyboard — wait for images + click Next ────────────────────────
+# ── Step 3: Storyboard ────────────────────────────────────────────────────────
 def step3_storyboard(page):
-    print("[Step 3] Storyboard — waiting for AI to generate images...")
+    print("[Step 3] Storyboard — waiting for AI to generate images (up to 3 min)...")
     dismiss_popups(page)
-    timeout = 120  # seconds to wait for storyboards
-    start = time.time()
-    while time.time() - start < timeout:
-        # Check for storyboard thumbnails in the sidebar
-        boards = page.locator("[class*='storyboard'] img, .scene-list img, [class*='scene'] img")
-        if boards.count() >= 2:
-            print(f"[Step 3] Storyboards ready ({boards.count()} detected).")
+
+    # Wait for storyboard/role-card images to appear (any img inside the edit page content)
+    js_count = """
+    () => {
+        // MagicLight storyboard images appear inside role-card or video-scene elements
+        const imgs = document.querySelectorAll('[class*="role-card"] img, [class*="scene"] img, [class*="storyboard"] img, [class*="story-board"] img, [class*="video-scene"] img, [class*="frame"] img');
+        return imgs.length;
+    }
+    """
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        count = page.evaluate(js_count)
+        if count >= 2:
+            print(f"[Step 3] ✓ Storyboard images ready ({count} found)")
             break
         time.sleep(5)
+        print(f"[Step 3] Waiting for storyboard images... ({int(deadline - time.time())}s left)")
     else:
-        print("[Step 3] Timeout waiting for storyboards — proceeding anyway.")
+        print("[Step 3] Timeout — proceeding anyway")
 
     time.sleep(3)
-    # Click Next (top-right corner)
-    print("[Step 3] Clicking Next (top-right)...")
-    for sel in ["button:has-text('Next')", "[class*='next-btn']", "button.btn-primary:has-text('Next')"]:
-        btn = page.locator(sel)
-        if btn.count() > 0 and btn.first.is_visible():
-            btn.first.click()
-            time.sleep(5)
-            return
-    raise Exception("Storyboard Next button not found")
+
+    # Click Next Step by class to proceed to Storyboard edit
+    print("[Step 3] Clicking Next Step via class (step2-footer-btn-left)...")
+    if _dom_click_class(page, "step2-footer-btn-left", timeout=20):
+        print("[Step 3] ✓ Done.")
+        time.sleep(4)
+        _dismiss_animation_modal(page)  # Dismiss animation modal
+        time.sleep(4)
+    else:
+        # Fallback text
+        if _dom_click_text(page, ["Next", "Next Step", "Create now"], timeout=15):
+            print("[Step 3] ✓ Done (fallback).")
+            time.sleep(4)
+            _dismiss_animation_modal(page)
+            time.sleep(4)
+        else:
+            _dom_debug_buttons(page)
+            print("[Step 3] Next button not found — proceeding to Step 4.")
 
 
-# ── Step 4: Edit — click Generate, confirm popup, wait for render ─────────────
-def step4_edit_and_generate(page) -> tuple[str, str, str, str]:
+# ── Step 4: Edit → Generate → Wait → Download ────────────────────────────────
+def step4_generate_and_download(page, row_label: str) -> dict:
     """
-    Clicks Generate, waits for video render, extracts title, thumbnail_url,
-    video_url, hashtags. Returns (video_id, title, thumbnail_url, hashtags).
+    Clicks Generate via DOM, confirms export popup, waits for render,
+    downloads video and thumbnail. Returns a dict with all extracted data.
     """
-    print("[Step 4] Edit — clicking Generate...")
+    print("[Step 4] Edit — navigating sub-steps to reach Generate screen...")
     dismiss_popups(page)
     time.sleep(3)
 
-    gen_btn = page.locator("button:has-text('Generate')")
-    gen_btn.wait_for(state="visible", timeout=30000)
-    gen_btn.first.click()
+    # The site has multiple sub-steps (Cast → Storyboard → Frame Edit → ... → Generate)
+    # Keep clicking Next (header-shiny-action__btn) until 'Generate' button appears
+    generate_texts = ["Generate", "Create Video", "Export", "Create now", "Render"]
+    max_next_clicks = 6
+    for attempt in range(max_next_clicks):
+        # Check if Generate is already on screen
+        js_has_generate = """
+        (texts) => {
+            const all = Array.from(document.querySelectorAll(
+                'button, div[class*="btn"], span[class*="btn"], div[class*="footer-btn"]'
+            ));
+            for (let i = all.length - 1; i >= 0; i--) {
+                const el = all[i];
+                let directText = '';
+                el.childNodes.forEach(n => { if (n.nodeType === Node.TEXT_NODE) directText += n.textContent; });
+                const t = (directText.trim() || (el.innerText || '').trim());
+                if (texts.includes(t)) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) return t;
+                }
+            }
+            return null;
+        }
+        """
+        found = page.evaluate(js_has_generate, generate_texts)
+        if found:
+            print(f"[Step 4] ✓ Found '{found}' button — ready to generate!")
+            break
+
+        print(f"[Step 4] Generate not yet visible (attempt {attempt+1}/{max_next_clicks}) — clicking Next...")
+        # Click BUTTON.arco-btn-primary with text 'Next' (confirmed nav button class)
+        js_click_primary_next = """
+        () => {
+            // Try arco-btn-primary buttons first (the confirmed Next button class)
+            const primaryBtns = Array.from(document.querySelectorAll('button.arco-btn-primary'));
+            for (const el of primaryBtns) {
+                const t = (el.innerText || '').trim();
+                const rect = el.getBoundingClientRect();
+                if (t === 'Next' && rect.width > 0 && rect.height > 0) {
+                    el.click();
+                    return 'Clicked arco-btn-primary Next';
+                }
+            }
+            // Fallback: any visible button with text 'Next'
+            const allBtns = Array.from(document.querySelectorAll('button'));
+            for (const el of allBtns) {
+                const t = (el.innerText || '').trim();
+                const rect = el.getBoundingClientRect();
+                if (t === 'Next' && rect.width > 0 && rect.height > 0) {
+                    el.click();
+                    return 'Clicked button Next (fallback)';
+                }
+            }
+            // Last resort: div header Next
+            const divs = Array.from(document.querySelectorAll('[class*="header-shiny-action__btn"]'));
+            for (const el of divs) {
+                const t = (el.innerText || '').trim();
+                const rect = el.getBoundingClientRect();
+                if (t === 'Next' && rect.width > 0 && rect.height > 0) {
+                    el.click();
+                    return 'Clicked header div Next';
+                }
+            }
+            return null;
+        }
+        """
+        result = page.evaluate(js_click_primary_next)
+        if result:
+            print(f"[Step 4] ✓ {result}")
+        else:
+            print("[Step 4] No Next button found at all")
+            _dom_debug_buttons(page)
+        time.sleep(3)
+        _dismiss_animation_modal(page)  # Dismiss animation modal if it appeared
+        time.sleep(3)
+        dismiss_popups(page)
+    else:
+        _dom_debug_buttons(page)
+        raise Exception("[Step 4] Could not reach Generate screen after max Next clicks")
+
+    # Click Generate
+    print("[Step 4] Clicking Generate...")
+    if not _dom_click_text(page, generate_texts, timeout=20):
+        _dom_debug_buttons(page)
+        raise Exception("[Step 4] Generate button found but click failed")
     time.sleep(3)
 
-    # Export popup: 16:9 and Standard (720p) are defaults — click OK
-    print("[Step 4] Confirming export settings...")
-    ok_btn = page.locator("button:has-text('OK')")
-    if ok_btn.count() > 0 and ok_btn.first.is_visible():
-        ok_btn.first.click()
+    # Export popup — click OK via DOM
+    print("[Step 4] Confirming export settings (OK) via DOM...")
+    _dom_click_text(page, ["OK", "Ok", "Confirm"], timeout=10)
     time.sleep(3)
     dismiss_popups(page)
 
-    # Wait for render to finish. Look for download button or success popup.
+    # ── Wait for render ───────────────────────────────────────────────────────
     print("[Step 4] Waiting for video render (up to 10 min)...")
     start = time.time()
     while time.time() - start < 600:
-        # Check for the success popup "Your work ... video has been generated"
-        success = page.locator("text='video has been generated'")
-        if success.count() > 0 and success.first.is_visible():
-            print("[Step 4] Success popup detected!")
+        # Success popup
+        if page.locator("text='video has been generated'").count() > 0:
+            print("[Step 4] ✓ 'Video generated' popup detected!")
             break
-        # Also check for download button
-        dl = page.locator("button:has-text('Download'), a:has-text('Download')")
-        if dl.count() > 0 and dl.first.is_visible():
-            print("[Step 4] Download button detected!")
+        # Or download button visible
+        dl_visible = page.locator("button:has-text('Download'), a:has-text('Download')")
+        if dl_visible.count() > 0 and dl_visible.first.is_visible():
+            print("[Step 4] ✓ Download button appeared!")
             break
+        elapsed = int(time.time() - start)
+        print(f"[Step 4] Still rendering... {elapsed}s elapsed")
         time.sleep(10)
-        print(f"[Step 4] Still rendering... ({int(time.time()-start)}s elapsed)")
 
-    # Dismiss the "generated" popup (click X)
+    # Dismiss the "generated" popup (click × or close)
     time.sleep(2)
     for sel in [
-        "button:has-text('×')",
-        "button[aria-label='Close']",
         ".arco-modal-close-btn",
+        "button:has-text('×')",
+        "[aria-label='Close']",
         ".popup-close",
-        "[class*='close']",
     ]:
         try:
             btn = page.locator(sel)
             if btn.count() > 0 and btn.first.is_visible():
                 btn.first.click()
-                break
         except Exception:
             pass
+    time.sleep(2)
 
-    # Extract video ID from URL
+    # ── Extract metadata ──────────────────────────────────────────────────────
     video_id = page.url.strip("/").split("/")[-1]
-    if not video_id or video_id in ["edit", "project"]:
-        video_id = "unknown_" + str(int(time.time()))
+    if not video_id or len(video_id) < 3:
+        video_id = f"gen_{int(time.time())}"
 
-    # Extract title from page
-    title = ""
+    gen_title = ""
     try:
-        title_el = page.locator("h1, .project-title, input[type='text'][value]").first
-        title = title_el.text_content() or title_el.get_attribute("value") or ""
-        title = title.strip()
+        for sel in ["h1", ".project-title", "input.title-input"]:
+            el = page.locator(sel)
+            if el.count() > 0:
+                t = (el.first.text_content() or el.first.get_attribute("value") or "").strip()
+                if t:
+                    gen_title = t
+                    break
     except Exception:
         pass
 
-    # Extract thumbnail image URL (the "Magic Thumbnail")
-    thumb_url = ""
-    try:
-        thumb = page.locator("[class*='thumbnail'] img, [class*='cover'] img").first
-        thumb_url = thumb.get_attribute("src") or ""
-    except Exception:
-        pass
-
-    # Extract hashtags if visible on the page
     hashtags = ""
     try:
-        tag_el = page.locator("[class*='hashtag'], [class*='tag']")
-        tags = [t.text_content().strip() for t in tag_el.all() if t.text_content()]
-        hashtags = " ".join(tags)
+        tags = page.locator("[class*='hashtag'], [class*='tag-item']").all()
+        hashtags = " ".join(t.text_content().strip() for t in tags if t.text_content())
     except Exception:
         pass
 
-    print(f"[Step 4] Video ID: {video_id}, Title: {title!r}")
-    return video_id, title, thumb_url, hashtags
-
-
-# ── Download video via Playwright Download event ──────────────────────────────
-def download_video(page, row_label: str) -> str:
-    """Click the Download button and save the video. Returns local path."""
-    print(f"[Download] Looking for video download button...")
-    dl_btn = page.locator("button:has-text('Download'), a:has-text('Download')")
-    if dl_btn.count() == 0:
-        print("[Download] No download button found.")
-        return ""
+    # ── Download thumbnail ────────────────────────────────────────────────────
+    thumb_local = ""
+    thumb_web = ""
     try:
-        with page.expect_download(timeout=120000) as dl_info:
-            dl_btn.first.click()
-        download: Download = dl_info.value
-        dest = os.path.join(DOWNLOADS_DIR, f"{row_label}_{download.suggested_filename or 'video.mp4'}")
-        download.save_as(dest)
-        print(f"[Download] Video saved to: {dest}")
-        return dest
+        thumb_img = page.locator("[class*='thumbnail'] img, [class*='cover-img'] img, [class*='magic-thumbnail'] img")
+        if thumb_img.count() > 0:
+            thumb_web = thumb_img.first.get_attribute("src") or ""
+            if thumb_web:
+                resp = requests.get(thumb_web, timeout=30)
+                ext = ".jpg"
+                dest = os.path.join(DOWNLOADS_DIR, f"{row_label}_thumb{ext}")
+                with open(dest, "wb") as f:
+                    f.write(resp.content)
+                thumb_local = dest
+                print(f"[Download] ✓ Thumbnail saved: {dest}")
+    except Exception as e:
+        print(f"[Download] Thumbnail failed: {e}")
+
+    # ── Download video ────────────────────────────────────────────────────────
+    video_local = ""
+    try:
+        print("[Download] Clicking Download Video button...")
+        dl_btn = page.locator("button:has-text('Download'), a:has-text('Download')")
+        if dl_btn.count() > 0:
+            with page.expect_download(timeout=120000) as dl_info:
+                dl_btn.first.click()
+            dl: Download = dl_info.value
+            dest = os.path.join(DOWNLOADS_DIR, f"{row_label}_{dl.suggested_filename or 'video.mp4'}")
+            dl.save_as(dest)
+            video_local = dest
+            print(f"[Download] ✓ Video saved: {dest}")
+        else:
+            print("[Download] No download button visible.")
     except Exception as e:
         print(f"[Download] Video download failed: {e}")
-        return ""
 
-
-def download_thumbnail(thumb_url: str, row_label: str) -> str:
-    """Download thumbnail image from URL. Returns local path."""
-    if not thumb_url:
-        return ""
-    try:
-        resp = requests.get(thumb_url, timeout=30)
-        ext = ".jpg" if "jpg" in thumb_url.lower() else ".png"
-        dest = os.path.join(DOWNLOADS_DIR, f"{row_label}_thumb{ext}")
-        with open(dest, "wb") as f:
-            f.write(resp.content)
-        print(f"[Download] Thumbnail saved to: {dest}")
-        return dest
-    except Exception as e:
-        print(f"[Download] Thumbnail download failed: {e}")
-        return ""
+    return {
+        "video_id": video_id,
+        "gen_title": gen_title,
+        "hashtags": hashtags,
+        "thumb_local": thumb_local,
+        "thumb_web": thumb_web,
+        "video_local": video_local,
+    }
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    args = parse_args()
+    limit = args.maxstory if args.maxstory is not None else STORIES_PER_RUN
+
     print("=" * 60)
-    print("  AutoMagicAI — MagicLight.AI Automation")
+    print(f"  AutoMagicAI — MagicLight.AI Automation")
+    print(f"  Stories this run: {limit} | Headless: {args.headless}")
     print("=" * 60)
 
-    # Validate config
     if not SPREADSHEET_ID:
-        print("[ERROR] SPREADSHEET_ID not set in .env")
-        return
+        print("[ERROR] SPREADSHEET_ID not set in .env"); return
     if not ML_EMAIL or not ML_PASSWORD:
-        print("[ERROR] ML_EMAIL / ML_PASSWORD not set in .env")
-        return
+        print("[ERROR] ML_EMAIL / ML_PASSWORD not set in .env"); return
 
-    # Connect to Google Sheet
+    # Google Sheets
     print("[Setup] Connecting to Google Sheets...")
     sheet = get_sheet()
     if not sheet:
         return
-
     records = sheet.get_all_records()
     print(f"[Setup] Found {len(records)} rows in sheet.")
 
-    # Connect to Google Drive if folder ID is set
+    # Google Drive
     drive_service = None
     if DRIVE_FOLDER_ID:
-        print("[Setup] Connecting to Google Drive...")
         try:
             drive_service = get_drive_service()
-            print("[Setup] Google Drive connected.")
+            print("[Setup] ✓ Google Drive connected.")
         except Exception as e:
-            print(f"[Setup] Drive connection failed (will skip upload): {e}")
+            print(f"[Setup] Drive error (upload disabled): {e}")
     else:
         print("[Setup] GOOGLE_DRIVE_FOLDER_ID not set — Drive upload disabled.")
 
     # Launch browser
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(
+            headless=args.headless,
+            args=["--start-maximized"],
+        )
         context = browser.new_context(
             accept_downloads=True,
-            viewport={"width": 1280, "height": 900},
+            no_viewport=True,
         )
         page = context.new_page()
 
@@ -485,11 +799,10 @@ def main():
         processed = 0
 
         for idx, row in enumerate(records, start=2):
-            if processed >= STORIES_PER_RUN:
-                print(f"\n[Limit] Reached {STORIES_PER_RUN} stories for this run. Stopping.")
+            if processed >= limit:
+                print(f"\n[Limit] Reached {limit} stories. Stopping.")
                 break
 
-            # Skip already-generated rows
             if row.get("Status", "").strip().lower() == "generated":
                 continue
 
@@ -497,7 +810,7 @@ def main():
             if not story:
                 continue
 
-            title_hint = row.get("Title", f"Row_{idx}")
+            title_hint = row.get("Title", f"Row_{idx}").strip() or f"Row_{idx}"
             moral = row.get("Moral", "").strip()
             row_label = f"row{idx}_{title_hint[:30].replace(' ', '_')}"
 
@@ -510,47 +823,41 @@ def main():
             print(f"{'='*60}")
 
             try:
-                # ── Generation Pipeline ────────────────────────────────────
+                # Run the full generation pipeline
                 step1_content(page, prompt)
                 step2_cast(page)
                 step3_storyboard(page)
-                video_id, gen_title, thumb_url, hashtags = step4_edit_and_generate(page)
+                result = step4_generate_and_download(page, row_label)
 
-                # Use generated title or fallback to sheet title
-                final_title = gen_title or title_hint
+                final_title = result["gen_title"] or title_hint
 
-                # ── Downloads ─────────────────────────────────────────────
-                video_local = download_video(page, row_label)
-                thumb_local = download_thumbnail(thumb_url, row_label)
-
-                # ── Drive Upload ──────────────────────────────────────────
+                # Drive upload
                 drive_video_url = ""
                 drive_thumb_url = ""
                 if drive_service and DRIVE_FOLDER_ID:
                     try:
-                        sub_folder_id = create_drive_folder(
-                            drive_service,
-                            f"Row_{idx}_{final_title[:40]}",
-                            DRIVE_FOLDER_ID,
-                        )
-                        if video_local and os.path.exists(video_local):
-                            drive_video_url = upload_to_drive(drive_service, video_local, sub_folder_id)
-                            print(f"[Drive] Video uploaded → {drive_video_url}")
-                        if thumb_local and os.path.exists(thumb_local):
-                            drive_thumb_url = upload_to_drive(drive_service, thumb_local, sub_folder_id)
-                            print(f"[Drive] Thumbnail uploaded → {drive_thumb_url}")
+                        folder_name = f"Row_{idx}_{final_title[:40]}"
+                        sub_id = create_drive_folder(drive_service, folder_name, DRIVE_FOLDER_ID)
+                        if result["video_local"] and os.path.exists(result["video_local"]):
+                            drive_video_url = upload_to_drive(drive_service, result["video_local"], sub_id)
+                            print(f"[Drive] ✓ Video → {drive_video_url}")
+                        if result["thumb_local"] and os.path.exists(result["thumb_local"]):
+                            drive_thumb_url = upload_to_drive(drive_service, result["thumb_local"], sub_id)
+                            print(f"[Drive] ✓ Thumbnail → {drive_thumb_url}")
                     except Exception as e:
                         print(f"[Drive] Upload error: {e}")
 
-                # ── Update Google Sheet ────────────────────────────────────
-                notes = f"Title: {final_title} | Hashtags: {hashtags}".strip(" |")
+                # Update sheet
+                notes = f"Title: {final_title}"
+                if result["hashtags"]:
+                    notes += f" | Tags: {result['hashtags']}"
+
                 sheet.update_cell(idx, COL_STATUS,    "Generated")
-                sheet.update_cell(idx, COL_VIDEO_ID,  video_id)
-                sheet.update_cell(idx, COL_THUMB_URL, drive_thumb_url or thumb_url)
+                sheet.update_cell(idx, COL_VIDEO_ID,  result["video_id"])
+                sheet.update_cell(idx, COL_THUMB_URL, drive_thumb_url or result["thumb_web"])
                 sheet.update_cell(idx, COL_VIDEO_URL, drive_video_url)
                 sheet.update_cell(idx, COL_NOTES,     notes)
-
-                print(f"[Sheet] Row {idx} updated ✓")
+                print(f"[Sheet] ✓ Row {idx} updated.")
                 processed += 1
 
             except Exception as e:
@@ -561,7 +868,10 @@ def main():
                 except Exception:
                     pass
 
-        print(f"\n[Done] Processed {processed} stories.")
+        print(f"\n{'='*60}")
+        print(f"  Done! Processed {processed}/{limit} stories.")
+        print(f"{'='*60}")
+        input("Press Enter to close the browser...")
         browser.close()
 
 
