@@ -803,10 +803,24 @@ def main():
     sheet = get_sheet()
     if not sheet:
         return
-    records = sheet.get_all_records(expected_headers=[
-        "Theme", "Title", "Story Text", "Moral", "Hashtags", "Date&Time", "Status",
-        "MagicThumbnail", "VideoID", "Generated Title", "Summary", "Generated Hashtags", "Notes", "ProjectURL"
-    ])
+    # Get all data and handle duplicate headers manually
+    all_data = sheet.get_all_values()
+    if len(all_data) < 2:
+        print("[ERROR] Sheet is empty or has no data rows")
+        return
+    
+    headers = all_data[0]  # First row is headers
+    records = []
+    
+    for row in all_data[1:]:  # Skip header row
+        if len(row) >= len(headers):
+            record = {}
+            for i, header in enumerate(headers):
+                if i < len(row):
+                    record[header] = row[i]
+                else:
+                    record[header] = ""
+            records.append(record)
     print(f"[Setup] Found {len(records)} rows in sheet.")
 
     drive_service = None
@@ -851,7 +865,7 @@ def main():
 
             # ── Check for pending retry (has a Project URL saved) ─────────────
             project_url = str(row.get("Project URL", "") or "").strip()
-            story       = row.get("Story Text", "").strip()
+            story       = row.get("Story", "").strip()
             if not story:
                 continue
 
