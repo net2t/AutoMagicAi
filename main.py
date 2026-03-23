@@ -858,9 +858,8 @@ def main():
 
             status = row.get("Status", "").strip().lower()
 
-            # ── Skip already-generated rows ──────────────────────────────────
-            # ✅ BUG FIX: was `!= "generated"` (inverted), now correct
-            if status == "generated":
+            # ── Only process stories with "Generated" status ────────────────────────────
+            if status != "generated":
                 continue
 
             # ── Check for pending retry (has a Project URL saved) ─────────────
