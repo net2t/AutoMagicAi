@@ -391,6 +391,63 @@ def _dom_debug_buttons(page):
     except Exception as e:
         print(f"[DEBUG] {e}")
 
+def _try_click_in_context(ctx, selectors: list) -> bool:
+    for sel in selectors:
+        try:
+            loc = ctx.locator(sel)
+            if loc.count() > 0:
+                target = loc.last
+                if target.is_visible():
+                    target.scroll_into_view_if_needed(timeout=2000)
+                    target.click(timeout=5000)
+                    return True
+        except Exception:
+            pass
+    return False
+
+def _click_next_step1(page, timeout: int = 30) -> bool:
+    deadline = time.time() + timeout
+    selectors = [
+        "button.arco-btn-primary:has-text('Next')",
+        "button:has-text('Next')",
+        "[role='button']:has-text('Next')",
+        "div:has-text('Next')",
+        "span:has-text('Next')",
+        "div[class*='btn']:has-text('Next')",
+    ]
+    while time.time() < deadline:
+        try:
+            dismiss_popups(page)
+            _dismiss_tour(page)
+        except Exception:
+            pass
+
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            pass
+
+        if _try_click_in_context(page, selectors):
+            return True
+
+        try:
+            for fr in page.frames:
+                if fr == page.main_frame:
+                    continue
+                if _try_click_in_context(fr, selectors):
+                    return True
+        except Exception:
+            pass
+
+        try:
+            if _dom_click_text(page, ["Next", "Next Step", "Continue"], timeout=3):
+                return True
+        except Exception:
+            pass
+
+        time.sleep(1.5)
+    return False
+
 def _click_next_header(page):
     """Click the header-shiny-action__btn Next div and dismiss any animation modal."""
     js = """() => {
@@ -452,19 +509,11 @@ def step1_content(page, story_text: str):
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     time.sleep(1)
 
-    # Click Next using _dom_click_text for robustness
-    deadline = time.time() + 20
-    while time.time() < deadline:
-        for sel in ["button.arco-btn-primary:has-text('Next')", "button:has-text('Next')"]:
-            try:
-                btn = page.locator(sel).last
-                if btn.is_visible():
-                    btn.click()
-                    time.sleep(STEP1_WAIT)
-                    return
-            except Exception:
-                pass
-        time.sleep(2)
+    if _click_next_step1(page, timeout=30):
+        time.sleep(STEP1_WAIT)
+        return
+
+    _dom_debug_buttons(page)
     raise Exception("[Step 1] Could not find Next button")
 
 
@@ -495,7 +544,7 @@ def step3_storyboard(page):
 
     js_count = """() => {
         const imgs = document.querySelectorAll(
-            '[class*="role-card"] img,[class*="scene"] img,[class*="storyboard"] img,'
+            '[class*="role-card"] img,[class*="scene"] img,[class*="storyboard"] img,' +
             '[class*="story-board"] img,[class*="video-scene"] img,[class*="frame"] img'
         );
         return imgs.length;
@@ -889,35 +938,71 @@ def main():
             print(f"{'='*60}")
 
             try:
-                # ── If we have a saved project URL, jump straight to Step 4 ──
-                if project_url and "magiclight.ai/project/edit/" in project_url:
-                    print(f"[Retry] Navigating to saved project: {project_url}")
-                    page.goto(project_url, timeout=60000)
-                    page.wait_for_load_state("domcontentloaded")
-                    time.sleep(6)
-                    dismiss_popups(page)
-                    _dismiss_tour(page)
-                    result = step4_generate_and_download(page, safe_title, safe_title)
+                max_attempts = int(os.getenv("ROW_MAX_ATTEMPTS", "2"))
+                last_err = None
+                result = None
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        if attempt > 1:
+                            print(f"[Retry] Attempt {attempt}/{max_attempts}...")
 
-                else:
-                    # ── Full pipeline ─────────────────────────────────────────
-                    step1_content(page, prompt)
+                        # ── If we have a saved project URL, reopen it and continue ──
+                        if project_url and "magiclight.ai/project/edit/" in project_url:
+                            print(f"[Retry] Navigating to saved project: {project_url}")
+                            page.goto(project_url, timeout=60000)
+                            page.wait_for_load_state("domcontentloaded")
+                            time.sleep(6)
+                            dismiss_popups(page)
+                            _dismiss_tour(page)
 
-                    # ── Save Project URL immediately after Step 1 ─────────────
-                    # The URL changes to /project/edit/<id> after clicking Next on Step 1
-                    time.sleep(3)
-                    current_url = page.url
-                    if "project/edit" in current_url:
+                            # Resume from Storyboard/Generate path
+                            step3_storyboard(page)
+                            result = step4_generate_and_download(page, safe_title, safe_title)
+
+                        else:
+                            # ── Full pipeline ─────────────────────────────────────────
+                            step1_content(page, prompt)
+
+                            # ── Save Project URL immediately after Step 1 ─────────────
+                            # The URL changes to /project/edit/<id> after clicking Next on Step 1
+                            time.sleep(3)
+                            current_url = page.url
+                            if "project/edit" in current_url:
+                                project_url = current_url
+                                try:
+                                    sheet.update_cell(idx, COL_PROJECT_URL, current_url)
+                                    sheet.update_cell(idx, COL_STATUS, "Pending")
+                                    print(f"[Sheet] ✓ Project URL saved: {current_url}")
+                                except Exception as e:
+                                    print(f"[Sheet] Could not save Project URL: {e}")
+
+                            step2_cast(page)
+                            step3_storyboard(page)
+                            result = step4_generate_and_download(page, safe_title, safe_title)
+
+                        last_err = None
+                        break
+
+                    except Exception as e:
+                        last_err = e
+                        print(f"[ERROR] Row {idx} attempt {attempt} failed: {e}")
+
+                        # Save Project URL on any error so the next attempt can reopen it
                         try:
-                            sheet.update_cell(idx, COL_PROJECT_URL, current_url)
-                            sheet.update_cell(idx, COL_STATUS, "Pending")
-                            print(f"[Sheet] ✓ Project URL saved: {current_url}")
-                        except Exception as e:
-                            print(f"[Sheet] Could not save Project URL: {e}")
+                            current_url = page.url
+                            if current_url and "project/edit" in current_url:
+                                project_url = current_url
+                                sheet.update_cell(idx, COL_PROJECT_URL, current_url)
+                                sheet.update_cell(idx, COL_STATUS, "Pending")
+                                sheet.update_cell(idx, COL_NOTES, f"Attempt {attempt} failed: {str(e)[:450]}")
+                                print(f"[Sheet] ✓ Project URL saved for retry: {current_url}")
+                        except Exception as se:
+                            print(f"[Sheet] Could not save Project URL for retry: {se}")
 
-                    step2_cast(page)
-                    step3_storyboard(page)
-                    result = step4_generate_and_download(page, safe_title, safe_title)
+                        time.sleep(3)
+
+                if last_err is not None:
+                    raise last_err
 
                 # ── Drive Upload ──────────────────────────────────────────────
                 drive_video_url = ""
