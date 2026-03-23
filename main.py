@@ -535,7 +535,6 @@ def step3_storyboard(page):
             _dom_debug_buttons(page)
             print("[Step 3] Next button not found — proceeding to Step 4.")
 
-
 # ── Step 4: Edit → Generate → Wait → Download ────────────────────────────────
 def step4_generate_and_download(page, row_label: str) -> dict:
     """
@@ -546,12 +545,9 @@ def step4_generate_and_download(page, row_label: str) -> dict:
     dismiss_popups(page)
     time.sleep(3)
 
-    # The site has multiple sub-steps (Cast → Storyboard → Frame Edit → ... → Generate)
-    # Keep clicking Next (header-shiny-action__btn) until 'Generate' button appears
     generate_texts = ["Generate", "Create Video", "Export", "Create now", "Render"]
     max_next_clicks = 6
     for attempt in range(max_next_clicks):
-        # Check if Generate is already on screen
         js_has_generate = """
         (texts) => {
             const all = Array.from(document.querySelectorAll(
@@ -576,10 +572,8 @@ def step4_generate_and_download(page, row_label: str) -> dict:
             break
 
         print(f"[Step 4] Generate not yet visible (attempt {attempt+1}/{max_next_clicks}) — clicking Next...")
-        # Click BUTTON.arco-btn-primary with text 'Next' (confirmed nav button class)
         js_click_primary_next = """
         () => {
-            // Try arco-btn-primary buttons first (the confirmed Next button class)
             const primaryBtns = Array.from(document.querySelectorAll('button.arco-btn-primary'));
             for (const el of primaryBtns) {
                 const t = (el.innerText || '').trim();
@@ -589,7 +583,6 @@ def step4_generate_and_download(page, row_label: str) -> dict:
                     return 'Clicked arco-btn-primary Next';
                 }
             }
-            // Fallback: any visible button with text 'Next'
             const allBtns = Array.from(document.querySelectorAll('button'));
             for (const el of allBtns) {
                 const t = (el.innerText || '').trim();
@@ -599,7 +592,6 @@ def step4_generate_and_download(page, row_label: str) -> dict:
                     return 'Clicked button Next (fallback)';
                 }
             }
-            // Last resort: div header Next
             const divs = Array.from(document.querySelectorAll('[class*="header-shiny-action__btn"]'));
             for (const el of divs) {
                 const t = (el.innerText || '').trim();
@@ -619,7 +611,7 @@ def step4_generate_and_download(page, row_label: str) -> dict:
             print("[Step 4] No Next button found at all")
             _dom_debug_buttons(page)
         time.sleep(3)
-        _dismiss_animation_modal(page)  # Dismiss animation modal if it appeared
+        _dismiss_animation_modal(page)
         time.sleep(3)
         dismiss_popups(page)
     else:
@@ -640,24 +632,91 @@ def step4_generate_and_download(page, row_label: str) -> dict:
     dismiss_popups(page)
 
     # ── Wait for render ───────────────────────────────────────────────────────
-    print("[Step 4] Waiting for video render (up to 10 min)...")
+    # ✅ FIX: Increased total wait from 600s → 900s (15 minutes)
+    # ✅ FIX: Poll every 15s instead of 10s to reduce false negatives
+    # ✅ FIX: Added more completion selectors (progress bar, done text, etc.)
+    # ✅ FIX: Added clear progress log every 30s so you can see it's alive
+    RENDER_TIMEOUT = 900      # 15 minutes total wait
+    POLL_INTERVAL  = 15       # check every 15 seconds
+    PROGRESS_EVERY = 30       # print status every 30 seconds
+
+    print(f"[Step 4] Waiting for video render (up to {RENDER_TIMEOUT // 60} min)...")
+    print("[Step 4] ⏳ Please be patient — MagicLight can take 5–10 minutes...")
+
     start = time.time()
-    while time.time() - start < 600:
-        # Success popup
-        if page.locator("text='video has been generated'").count() > 0:
-            print("[Step 4] ✓ 'Video generated' popup detected!")
-            break
-        # Or download button visible
-        dl_visible = page.locator("button:has-text('Download'), a:has-text('Download')")
-        if dl_visible.count() > 0 and dl_visible.first.is_visible():
-            print("[Step 4] ✓ Download button appeared!")
-            break
+    last_progress_print = start
+
+    while time.time() - start < RENDER_TIMEOUT:
         elapsed = int(time.time() - start)
-        print(f"[Step 4] Still rendering... {elapsed}s elapsed")
-        time.sleep(10)
+
+        # ── Check 1: Success popup text ──
+        for success_text in [
+            "video has been generated",
+            "Video generated",
+            "generation complete",
+            "successfully generated",
+            "video is ready",
+            "Your video is ready",
+        ]:
+            try:
+                if page.locator(f"text='{success_text}'").count() > 0:
+                    print(f"[Step 4] ✓ SUCCESS detected: '{success_text}' ({elapsed}s)")
+                    time.sleep(5)   # ✅ FIX: buffer for page to fully settle
+                    break
+            except Exception:
+                pass
+        else:
+            # ── Check 2: Download button visible ──
+            try:
+                dl_visible = page.locator(
+                    "button:has-text('Download'), "
+                    "a:has-text('Download'), "
+                    "[class*='download-btn'], "
+                    "[class*='download_btn']"
+                )
+                if dl_visible.count() > 0 and dl_visible.first.is_visible():
+                    print(f"[Step 4] ✓ Download button appeared! ({elapsed}s)")
+                    time.sleep(5)   # ✅ FIX: buffer for page to fully settle
+                    break
+            except Exception:
+                pass
+
+            # ── Check 3: Progress bar gone (render complete indicator) ──
+            try:
+                progress_bar = page.locator(
+                    "[class*='progress-bar'], "
+                    "[class*='generating'], "
+                    "[class*='render-progress']"
+                )
+                if progress_bar.count() == 0:
+                    # Only treat as done if we've waited at least 60 seconds
+                    # (to avoid false positive at the very start)
+                    if elapsed > 60:
+                        print(f"[Step 4] ✓ Progress bar gone — render likely complete ({elapsed}s)")
+                        time.sleep(5)
+                        break
+            except Exception:
+                pass
+
+            # ── Print progress every 30 seconds ──
+            if time.time() - last_progress_print >= PROGRESS_EVERY:
+                mins  = elapsed // 60
+                secs  = elapsed % 60
+                remaining = RENDER_TIMEOUT - elapsed
+                print(f"[Step 4] ⏳ Still rendering... {mins}m {secs}s elapsed | "
+                      f"{remaining // 60}m {remaining % 60}s remaining")
+                last_progress_print = time.time()
+
+            time.sleep(POLL_INTERVAL)
+
+    else:
+        # Timeout reached — log but DO NOT crash, try to download anyway
+        print(f"[Step 4] ⚠️  Render timeout after {RENDER_TIMEOUT // 60} min — attempting download anyway...")
+
+    # ✅ FIX: Extra settle time before download attempts
+    time.sleep(5)
 
     # Dismiss the "generated" popup (click × or close)
-    time.sleep(2)
     for sel in [
         ".arco-modal-close-btn",
         "button:has-text('×')",
@@ -700,7 +759,11 @@ def step4_generate_and_download(page, row_label: str) -> dict:
     thumb_local = ""
     thumb_web = ""
     try:
-        thumb_img = page.locator("[class*='thumbnail'] img, [class*='cover-img'] img, [class*='magic-thumbnail'] img")
+        thumb_img = page.locator(
+            "[class*='thumbnail'] img, "
+            "[class*='cover-img'] img, "
+            "[class*='magic-thumbnail'] img"
+        )
         if thumb_img.count() > 0:
             thumb_web = thumb_img.first.get_attribute("src") or ""
             if thumb_web:
@@ -715,12 +778,13 @@ def step4_generate_and_download(page, row_label: str) -> dict:
         print(f"[Download] Thumbnail failed: {e}")
 
     # ── Download video ────────────────────────────────────────────────────────
+    # ✅ FIX: Increased download button wait from 120s → 180s
     video_local = ""
     try:
         print("[Download] Clicking Download Video button...")
         dl_btn = page.locator("button:has-text('Download'), a:has-text('Download')")
         if dl_btn.count() > 0:
-            with page.expect_download(timeout=120000) as dl_info:
+            with page.expect_download(timeout=180000) as dl_info:
                 dl_btn.first.click()
             dl: Download = dl_info.value
             dest = os.path.join(DOWNLOADS_DIR, f"{row_label}_{dl.suggested_filename or 'video.mp4'}")
@@ -733,11 +797,11 @@ def step4_generate_and_download(page, row_label: str) -> dict:
         print(f"[Download] Video download failed: {e}")
 
     return {
-        "video_id": video_id,
-        "gen_title": gen_title,
-        "hashtags": hashtags,
+        "video_id":    video_id,
+        "gen_title":   gen_title,
+        "hashtags":    hashtags,
         "thumb_local": thumb_local,
-        "thumb_web": thumb_web,
+        "thumb_web":   thumb_web,
         "video_local": video_local,
     }
 
