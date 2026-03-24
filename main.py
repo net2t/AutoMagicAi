@@ -681,15 +681,6 @@ def step4_generate_and_download(page, row_label: str, safe_title: str) -> dict:
         except Exception:
             pass
 
-        # Check 3: "Download video" text anywhere on page
-        try:
-            if page.locator("text='Download video'").count() > 0:
-                print(f"[Step 4] ✓ 'Download video' text detected ({elapsed}s)")
-                render_done = True
-                break
-        except Exception:
-            pass
-
         # Progress log
         if time.time() - last_progress_log >= PROGRESS_EVERY:
             mins = elapsed // 60
@@ -763,56 +754,71 @@ def step4_generate_and_download(page, row_label: str, safe_title: str) -> dict:
     os.makedirs(local_folder, exist_ok=True)
     print(f"[Download] Local folder: {local_folder}")
 
+    def wait_for_download_button(_page, timeout=120):
+        print("[Step 4] Waiting for REAL download button...")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                btn = _page.locator(
+                    "a[href*='.mp4'], video source[src*='.mp4'], a:has-text('Download video')"
+                )
+                if btn.count() > 0:
+                    print("[Step 4] ✓ Real download element found")
+                    return btn.first
+            except Exception:
+                pass
+            time.sleep(3)
+        return None
+
     # ── Download Magic Thumbnail ──────────────────────────────────────────────
     thumb_local = ""
     thumb_web   = ""
     try:
-        # The Magic Thumbnail is inside a specific container
-        thumb_img = page.locator(
-            "[class*='magic-thumbnail'] img, "
-            "[class*='thumbnail'] img, "
-            "[class*='cover-img'] img"
-        )
-        if thumb_img.count() > 0:
-            thumb_web = thumb_img.first.get_attribute("src") or ""
-            if thumb_web:
-                resp = requests.get(thumb_web, timeout=30)
-                dest = os.path.join(local_folder, f"{safe_title}_thumbnail.jpg")
-                with open(dest, "wb") as f:
-                    f.write(resp.content)
-                thumb_local = dest
-                print(f"[Download] ✓ Thumbnail → {dest}")
+        thumb_web = page.evaluate("""() => {
+            const img = document.querySelector("img[src*='http']");
+            return img ? img.src : null;
+        }""") or ""
+        if thumb_web:
+            dest = os.path.join(local_folder, f"{safe_title}_thumbnail.jpg")
+            resp = requests.get(thumb_web, timeout=30)
+            with open(dest, "wb") as f:
+                f.write(resp.content)
+            thumb_local = dest
+            print(f"[Download] ✓ Thumbnail → {dest}")
     except Exception as e:
         print(f"[Download] Thumbnail failed: {e}")
 
     # ── Download Video ────────────────────────────────────────────────────────
     video_local = ""
     try:
-        print("[Download] Waiting for Download Video button...")
-        # Look for the specific "Download video" button (not Download thumbnail)
-        dl_btn = page.locator(
-            "button:has-text('Download video'), "
-            "a:has-text('Download video'), "
-            "button:has-text('Download'), "
-            "a:has-text('Download')"
-        )
-        # Wait up to 30s for download button
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            if dl_btn.count() > 0 and dl_btn.first.is_visible():
-                break
-            time.sleep(3)
+        _ = wait_for_download_button(page, timeout=120)
+        print("[Download] Extracting video URL...")
 
-        if dl_btn.count() > 0:
-            with page.expect_download(timeout=180000) as dl_info:
-                dl_btn.first.click()
-            dl: Download = dl_info.value
+        video_url = page.evaluate("""() => {
+            const vid = document.querySelector("video");
+            if (vid && vid.src) return vid.src;
+            const src = document.querySelector("video source");
+            if (src && src.src) return src.src;
+            const a = document.querySelector("a[href*='.mp4']");
+            if (a && a.href) return a.href;
+            return null;
+        }""")
+
+        if video_url:
+            print(f"[Download] ✓ Video URL found: {str(video_url)[:80]}...")
             dest = os.path.join(local_folder, f"{safe_title}.mp4")
-            dl.save_as(dest)
+
+            r = requests.get(video_url, stream=True, timeout=60)
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
             video_local = dest
-            print(f"[Download] ✓ Video → {dest}")
+            print(f"[Download] ✓ Video saved → {dest}")
         else:
-            print("[Download] No download button found.")
+            print("[Download] ❌ No video URL found")
     except Exception as e:
         print(f"[Download] Video failed: {e}")
 
@@ -1034,7 +1040,10 @@ def main():
                 final_title = result["gen_title"] or title_hint
                 notes       = f"Generated OK | local: {result['local_folder']}"
 
-                sheet.update_cell(idx, COL_STATUS,      "Generated")
+                if result["video_local"]:
+                    sheet.update_cell(idx, COL_STATUS,      "Generated")
+                else:
+                    sheet.update_cell(idx, COL_STATUS,      "Failed")
                 sheet.update_cell(idx, COL_THUMB_URL,   drive_thumb_url or result["thumb_web"])
                 sheet.update_cell(idx, COL_VIDEO_ID,    result["video_id"])
                 sheet.update_cell(idx, COL_GEN_TITLE,   final_title)
@@ -1057,8 +1066,8 @@ def main():
         print(f"  Done! Processed {processed}/{limit} stories.")
         print(f"{'='*60}")
 
-        if not shutdown_requested:
-            input("Press Enter to close the browser...")
+        print("[Done] Closing browser automatically...")
+        time.sleep(3)
 
         browser.close()
         browser_instance = None
