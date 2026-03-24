@@ -1,6 +1,8 @@
 # Environment & secrets
 .env
 credentials.json
+oauth_credentials.json
+token.json
 cookies.json
 
 # Python cache
