@@ -18,6 +18,13 @@ from google.oauth2.service_account import Credentials as GACredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from dotenv import load_dotenv
+try:
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials as OAuthCredentials
+    _OAUTH_LIB_OK = True
+except ImportError:
+    _OAUTH_LIB_OK = False
 
 # ── Load config ───────────────────────────────────────────────────────────────
 load_dotenv()
@@ -36,9 +43,11 @@ STEP4_RENDER_TIMEOUT = int(os.getenv("STEP4_RENDER_TIMEOUT", "900"))  # seconds 
 STEP4_POLL_INTERVAL  = int(os.getenv("STEP4_POLL_INTERVAL",  "15"))   # how often to check render status
 STEP4_MAX_NEXT       = int(os.getenv("STEP4_MAX_NEXT",       "10"))   # max Next clicks before reaching Generate
 
-CREDS_FILE    = "credentials.json"
-COOKIES_FILE  = "cookies.json"
-DOWNLOADS_DIR = os.path.join(os.path.dirname(__file__), "downloads")
+CREDS_FILE        = "credentials.json"
+OAUTH_CREDS_FILE  = "oauth_credentials.json"
+OAUTH_TOKEN_FILE  = "token.json"
+COOKIES_FILE      = "cookies.json"
+DOWNLOADS_DIR     = os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 # ── Google API scopes ─────────────────────────────────────────────────────────
@@ -106,6 +115,41 @@ def get_sheet():
 
 # ── Google Drive ──────────────────────────────────────────────────────────────
 def get_drive_service():
+    """
+    Build a Google Drive service.
+    Priority:
+      1. oauth_credentials.json   — OAuth2 user account (personal Drive)
+         Token is cached in token.json after first browser login.
+      2. credentials.json         — Service account (shared Drive)
+    """
+    # — Option 1: OAuth2 user credentials ——————————————————————
+    if _OAUTH_LIB_OK and os.path.exists(OAUTH_CREDS_FILE):
+        oauth_creds = None
+        # Load cached token
+        if os.path.exists(OAUTH_TOKEN_FILE):
+            try:
+                oauth_creds = OAuthCredentials.from_authorized_user_file(
+                    OAUTH_TOKEN_FILE, DRIVE_SCOPES
+                )
+            except Exception:
+                oauth_creds = None
+        # Refresh or run new OAuth flow
+        if not oauth_creds or not oauth_creds.valid:
+            if oauth_creds and oauth_creds.expired and oauth_creds.refresh_token:
+                oauth_creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    OAUTH_CREDS_FILE, DRIVE_SCOPES
+                )
+                oauth_creds = flow.run_local_server(port=0)
+            # Cache the token
+            with open(OAUTH_TOKEN_FILE, "w") as tf:
+                tf.write(oauth_creds.to_json())
+        print("[Drive] Using OAuth2 user credentials (oauth_credentials.json)")
+        return build("drive", "v3", credentials=oauth_creds)
+
+    # — Option 2: Service account ————————————————————————————
+    print("[Drive] Using service account credentials (credentials.json)")
     creds = GACredentials.from_service_account_file(CREDS_FILE, scopes=DRIVE_SCOPES)
     return build("drive", "v3", credentials=creds)
 
@@ -472,6 +516,92 @@ def _click_next_header(page):
 
 
 # ── Step 1: Content ───────────────────────────────────────────────────────────
+def _open_dropdown_and_select(page, label_text: str, option_text: str) -> bool:
+    """
+    For Arco-Design / custom select components:
+    1. Finds the dropdown trigger next to a label whose text matches label_text.
+    2. Clicks the trigger to open the popup.
+    3. Waits for the option list to appear and clicks the matching item.
+    """
+    # Step A — open the dropdown by clicking the trigger near the label
+    js_open = """(label) => {
+        // Find all text nodes that match the label
+        const allEls = Array.from(document.querySelectorAll('label,div,span,p'));
+        for (const el of allEls) {
+            const own = Array.from(el.childNodes)
+                .filter(n => n.nodeType === Node.TEXT_NODE)
+                .map(n => n.textContent.trim()).join('');
+            if (own !== label && (el.innerText || '').trim() !== label) continue;
+
+            // Walk up to find a row/form-item container
+            let container = el.parentElement;
+            for (let i = 0; i < 6; i++) {
+                if (!container) break;
+                // Look for arco select trigger or any trigger inside this container
+                const trigger = container.querySelector(
+                    '.arco-select-view, .arco-select-view-input, '
+                    + '[class*="select-view"], [class*="select-trigger"], '
+                    + '[class*="arco-select"]'
+                );
+                if (trigger) {
+                    const r = trigger.getBoundingClientRect();
+                    if (r.width > 0) { trigger.click(); return 'opened:' + label; }
+                }
+                container = container.parentElement;
+            }
+        }
+        return null;
+    }"""
+    # Step B — pick the option from the open popup
+    js_pick = """(option) => {
+        // Arco select popup OR any visible list popup
+        const popup = document.querySelector(
+            '.arco-select-popup .arco-select-option, '
+            + '[class*="select-popup"] [class*="option"], '
+            + '[class*="dropdown"] li, [class*="select-list"] li'
+        );
+        if (!popup) return null;
+        const items = Array.from(document.querySelectorAll(
+            '.arco-select-option, [class*="select-option"], [class*="option-item"]'
+        ));
+        const visible = items.filter(el => {
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+        });
+        for (const el of visible) {
+            const t = (el.innerText || '').trim();
+            if (t === option) { el.click(); return 'selected:' + option; }
+        }
+        // Fallback: any visible li / div matching text
+        const all = Array.from(document.querySelectorAll('li,div'));
+        for (const el of all) {
+            if ((el.innerText || '').trim() !== option) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) { el.click(); return 'fallback:' + option; }
+        }
+        return null;
+    }"""
+    try:
+        opened = page.evaluate(js_open, label_text)
+        if not opened:
+            print(f"[Step 1] ⚠ Could not open dropdown for '{label_text}'")
+            return False
+        time.sleep(1)  # wait for popup to animate open
+        picked = page.evaluate(js_pick, option_text)
+        if picked:
+            print(f"[Step 1] ✓ {label_text} → '{option_text}' ({picked})")
+            time.sleep(0.5)
+            return True
+        else:
+            print(f"[Step 1] ⚠ Option '{option_text}' not found in '{label_text}' dropdown")
+            # Close the popup by pressing Escape
+            page.keyboard.press("Escape")
+            return False
+    except Exception as e:
+        print(f"[Step 1] Dropdown select error ({label_text}): {e}")
+        return False
+
+
 def step1_content(page, story_text: str):
     print("[Step 1] Navigating to Kids Story page...")
     page.goto("https://magiclight.ai/kids-story/", timeout=60000)
@@ -502,8 +632,23 @@ def step1_content(page, story_text: str):
         r169 = page.locator("text='16:9'")
         if r169.count() > 0 and r169.first.is_visible():
             r169.first.click()
+            time.sleep(0.5)
     except Exception:
         pass
+
+    # Scroll down so the Voiceover / Music dropdowns are visible
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    time.sleep(1)
+
+    # ── Voiceover: Sophia ─────────────────────────────────────────────────
+    print("[Step 1] Setting voiceover to Sophia...")
+    _open_dropdown_and_select(page, "Voiceover", "Sophia")
+    time.sleep(0.5)
+
+    # ── Background music: Silica ────────────────────────────────────────────
+    print("[Step 1] Setting background music to Silica...")
+    _open_dropdown_and_select(page, "Background Music", "Silica")
+    time.sleep(0.5)
 
     print(f"[Step 1] Clicking Next (will wait {STEP1_WAIT}s after)...")
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -576,6 +721,72 @@ def step3_storyboard(page):
     time.sleep(4)
 
 
+# ── Step 3b: Edit page — Subtitle settings ─────────────────────────────────────
+def step3b_edit_settings(page):
+    """
+    On the Edit page (Content->Cast->Storyboard->Edit) set:
+      Subtitle Settings tab -> 10th style
+    """
+    print("[Step 3b] Configuring Edit settings (Subtitle style)...")
+    dismiss_popups(page)
+    time.sleep(2)
+
+    # Click 'Subtitle Settings' tab
+    clicked_tab = False
+    for tab_text in ["Subtitle Settings", "Subtitle", "Caption"]:
+        try:
+            tab = page.locator(f"text='{tab_text}'")
+            if tab.count() > 0 and tab.first.is_visible():
+                tab.first.click()
+                print(f"[Step 3b] \u2713 Clicked tab: {tab_text}")
+                clicked_tab = True
+                time.sleep(1.5)
+                break
+        except Exception:
+            pass
+    if not clicked_tab:
+        print("[Step 3b] Subtitle Settings tab not found \u2014 trying JS...")
+        page.evaluate("""() => {
+            const els = Array.from(document.querySelectorAll('div,span,li,a'));
+            for (const el of els) {
+                const t = (el.innerText || '').trim();
+                if ((t === 'Subtitle Settings' || t === 'Subtitle')
+                        && el.getBoundingClientRect().width > 0) {
+                    el.click(); return t;
+                }
+            }
+        }""")
+        time.sleep(1.5)
+
+    # Select the 10th subtitle style card from the visible grid.
+    # Real MagicLight class confirmed: .coverFontList-item (17 items total)
+    # index 0 = 'No Subtitle', index 9 = 10th card
+    result = page.evaluate("""() => {
+        // Try the confirmed class first
+        let candidates = Array.from(document.querySelectorAll('.coverFontList-item'));
+        // Broad fallback selectors if class changes
+        if (candidates.length === 0) {
+            candidates = Array.from(document.querySelectorAll(
+                '[class*="coverFont"] [class*="item"], [class*="coverFont"] li,'
+                + '[class*="subtitle-item"], [class*="subtitle-style"] > div,'
+                + '[class*="subtitle"] [class*="item"], [class*="subtitle"] [class*="card"],'
+                + '[class*="caption-style"] > div, [class*="caption"] [class*="item"]'
+            ));
+        }
+        const visible = candidates.filter(el => {
+            const r = el.getBoundingClientRect();
+            return r.width > 5 && r.height > 5;
+        });
+        if (visible.length >= 10) {
+            visible[9].click();
+            return 'clicked index 10 of ' + visible.length;
+        }
+        return 'only ' + visible.length + ' items found';
+    }""")
+    print(f"[Step 3b] Subtitle style: {result}")
+    time.sleep(1)
+
+
 # ── Step 4: Edit → Generate → Wait → Download ─────────────────────────────────
 def step4_generate_and_download(page, row_label: str, safe_title: str) -> dict:
     print("[Step 4] Navigating sub-steps to reach Generate screen...")
@@ -644,38 +855,67 @@ def step4_generate_and_download(page, row_label: str, safe_title: str) -> dict:
     dismiss_popups(page)
 
     # ── Wait for render ───────────────────────────────────────────────────────
-    PROGRESS_EVERY = 30
+    PROGRESS_EVERY  = 30
+    RELOAD_EVERY    = 120  # reload page every 2 min to pick up state changes
     print(f"[Step 4] ⏳ Waiting for render (up to {STEP4_RENDER_TIMEOUT // 60} min)...")
     print("[Step 4]    MagicLight usually takes 5–10 minutes — please be patient...")
 
-    start              = time.time()
-    last_progress_log  = start
-    render_done        = False
+    start             = time.time()
+    last_progress_log = start
+    last_reload       = start
+    render_done       = False
+
+    # JS snippet: true when a visible Download button / video / complete text is present
+    js_render_ready = """() => {
+        // Check for completion text
+        const bodyText = (document.body && document.body.innerText) || '';
+        const doneKw = ['video has been generated','Video generated','generation complete',
+                        'successfully generated','video is ready','Your video is ready',
+                        'Export completed','Export success'];
+        for (const kw of doneKw) {
+            if (bodyText.includes(kw)) return 'text:' + kw;
+        }
+        // Check for a real mp4 in a <video> tag
+        const vid = document.querySelector('video[src*=".mp4"], video source[src*=".mp4"]');
+        if (vid && vid.src) return 'video:' + vid.src.substring(0, 80);
+        // Check for a download anchor
+        const dlA = document.querySelector('a[href*=".mp4"], a[download]');
+        if (dlA && dlA.offsetWidth > 0) return 'anchor:' + (dlA.href || 'no-href').substring(0, 80);
+        // Check for visible download button by text
+        const allBtns = Array.from(document.querySelectorAll('button,a,div[class*="btn"],span[class*="btn"]'));
+        for (const el of allBtns) {
+            const t = (el.innerText || '').trim();
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0 &&
+                (t === 'Download' || t === 'Download video' || t === 'Download Video' ||
+                 t === 'Save video' || t === 'Export')) {
+                return 'btn:' + t;
+            }
+        }
+        // Check for [class*=download] button
+        const dlBtn = document.querySelector('[class*="download-btn"],[class*="download_btn"],[class*="export-btn"]');
+        if (dlBtn && dlBtn.offsetWidth > 0) return 'dlclass:' + dlBtn.className.substring(0, 60);
+        return null;
+    }"""
 
     while time.time() - start < STEP4_RENDER_TIMEOUT:
         elapsed = int(time.time() - start)
 
-        # Check 1: success popup text
-        for txt in ["video has been generated", "Video generated", "generation complete",
-                    "successfully generated", "video is ready", "Your video is ready"]:
+        # Reload periodically so the page reflects latest render state
+        if time.time() - last_reload >= RELOAD_EVERY:
             try:
-                if page.locator(f"text='{txt}'").count() > 0:
-                    print(f"[Step 4] ✓ Render complete: '{txt}' ({elapsed}s)")
-                    render_done = True
-                    break
-            except Exception:
-                pass
-        if render_done:
-            break
+                print("[Step 4] 🔄 Reloading page to check render status...")
+                page.reload(timeout=30000, wait_until="domcontentloaded")
+                time.sleep(5)
+                dismiss_popups(page)
+            except Exception as reload_err:
+                print(f"[Step 4] Reload skipped: {reload_err}")
+            last_reload = time.time()
 
-        # Check 2: Download video button appeared
         try:
-            dl = page.locator(
-                "button:has-text('Download video'), a:has-text('Download video'),"
-                "[class*='download-btn'], [class*='download_btn']"
-            )
-            if dl.count() > 0 and dl.first.is_visible():
-                print(f"[Step 4] ✓ Download button visible ({elapsed}s)")
+            ready_signal = page.evaluate(js_render_ready)
+            if ready_signal:
+                print(f"[Step 4] ✓ Render ready ({elapsed}s) — signal: {ready_signal}")
                 render_done = True
                 break
         except Exception:
@@ -686,14 +926,14 @@ def step4_generate_and_download(page, row_label: str, safe_title: str) -> dict:
             mins = elapsed // 60
             secs = elapsed % 60
             rem  = STEP4_RENDER_TIMEOUT - elapsed
-            print(f"[Step 4] ⏳ {mins}m {secs}s elapsed | "
-                  f"{rem // 60}m {rem % 60}s remaining...")
+            print(f"[Step 4] ⏳ {mins}m {secs}s elapsed | {rem // 60}m {rem % 60}s remaining...")
             last_progress_log = time.time()
 
         time.sleep(STEP4_POLL_INTERVAL)
 
     if not render_done:
         print(f"[Step 4] ⚠️  Render timeout ({STEP4_RENDER_TIMEOUT // 60} min) — trying to download anyway...")
+        _dom_debug_buttons(page)
 
     time.sleep(5)  # Settle buffer
 
@@ -713,112 +953,264 @@ def step4_generate_and_download(page, row_label: str, safe_title: str) -> dict:
     if not video_id or len(video_id) < 3:
         video_id = f"gen_{int(time.time())}"
 
-    # Generated Title (from h1 or input)
-    gen_title = ""
-    try:
-        for sel in ["h1", ".project-title", "input.title-input", "[class*='project-name']"]:
-            el = page.locator(sel)
-            if el.count() > 0:
-                t = (el.first.text_content() or el.first.get_attribute("value") or "").strip()
-                if t:
-                    gen_title = t
-                    break
-    except Exception:
-        pass
+    # Label-walking JS: scans page for a label whose visible text matches,
+    # then looks inside the same container for an input/textarea/div with content.
+    meta = page.evaluate("""() => {
+        function getValueByLabel(labelText) {
+            // Walk every element, find one whose OWN text (direct text nodes) equals labelText
+            const all = Array.from(document.querySelectorAll('div,span,label,p,h3,h4,h5'));
+            for (const el of all) {
+                // Build text from direct child text nodes only
+                const own = Array.from(el.childNodes)
+                    .filter(n => n.nodeType === 3)
+                    .map(n => n.textContent.trim())
+                    .join('');
+                if (own !== labelText && (el.innerText || '').trim() !== labelText) continue;
+                // Found label element - look for value in parent/sibling containers
+                const r = el.getBoundingClientRect();
+                if (r.width === 0) continue;  // skip hidden labels
 
-    # Summary (from the Summary panel)
-    summary = ""
-    try:
-        for sel in ["[class*='summary'] p", "[class*='summary'] div",
-                    "textarea[class*='summary']", ".video-summary", "[class*='video-desc']"]:
-            el = page.locator(sel)
-            if el.count() > 0:
-                t = (el.first.text_content() or "").strip()
-                if t and len(t) > 10:
-                    summary = t
-                    break
-    except Exception:
-        pass
+                // Walk up to 5 ancestors looking for an input/textarea
+                let container = el.parentElement;
+                for (let i = 0; i < 5; i++) {
+                    if (!container) break;
+                    const inputs = Array.from(container.querySelectorAll(
+                        'input, textarea, [contenteditable="true"]'
+                    ));
+                    for (const inp of inputs) {
+                        const v = (inp.value || inp.innerText || inp.textContent || '').trim();
+                        if (v && v.length > 2) return v;
+                    }
+                    container = container.parentElement;
+                }
+                // Also try next siblings of the label's parent
+                let sib = el.parentElement && el.parentElement.nextElementSibling;
+                while (sib) {
+                    const inp = sib.querySelector('input, textarea, [contenteditable]');
+                    if (inp) {
+                        const v = (inp.value || inp.innerText || '').trim();
+                        if (v && v.length > 2) return v;
+                    }
+                    const v = (sib.innerText || '').trim();
+                    if (v && v.length > 5 && v !== labelText) return v;
+                    sib = sib.nextElementSibling;
+                }
+            }
+            return '';
+        }
 
-    # Hashtags (from hashtag chips)
-    hashtags = ""
-    try:
-        tags = page.locator("[class*='hashtag'], [class*='tag-item'], [class*='hash-tag']").all()
-        hashtags = " ".join(t.text_content().strip() for t in tags if t.text_content())
-    except Exception:
-        pass
+        const title    = getValueByLabel('Title');
+        const summary  = getValueByLabel('Summary');
+        const hashtags = getValueByLabel('Hashtags');
+        return { title, summary, hashtags };
+    }""")
+
+    gen_title = (meta or {}).get("title", "").strip()
+    summary   = (meta or {}).get("summary", "").strip()
+    hashtags  = (meta or {}).get("hashtags", "").strip()
+    print(f"[Meta] Title    : {gen_title[:80] if gen_title else 'NOT FOUND'}")
+    print(f"[Meta] Summary  : {summary[:80] if summary else 'NOT FOUND'}")
+    print(f"[Meta] Hashtags : {hashtags[:80] if hashtags else 'NOT FOUND'}")
 
     # ── Build local folder ────────────────────────────────────────────────────
-    # Folder name: Row_2_Luna_and_the_Lantern  (safe for filesystem)
     local_folder = os.path.join(DOWNLOADS_DIR, safe_title)
     os.makedirs(local_folder, exist_ok=True)
     print(f"[Download] Local folder: {local_folder}")
 
-    def wait_for_download_button(_page, timeout=120):
-        print("[Step 4] Waiting for REAL download button...")
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                btn = _page.locator(
-                    "a[href*='.mp4'], video source[src*='.mp4'], a:has-text('Download video')"
-                )
-                if btn.count() > 0:
-                    print("[Step 4] ✓ Real download element found")
-                    return btn.first
-            except Exception:
-                pass
-            time.sleep(3)
-        return None
+    # ── Collect browser cookies for authenticated requests ────────────────────
+    def _cookies_dict(pg):
+        try:
+            return {c["name"]: c["value"] for c in pg.context.cookies()}
+        except Exception:
+            return {}
 
     # ── Download Magic Thumbnail ──────────────────────────────────────────────
+    # The Magic Thumbnail card is identified by the "Magic Thumbnail" heading text
+    # on the page. We locate the img inside that section, and click its Download button.
     thumb_local = ""
     thumb_web   = ""
     try:
+        dest = os.path.join(local_folder, f"{safe_title}_thumbnail.jpg")
+
+        # Step 1: get the img URL from the Magic Thumbnail section
+        # Walk up from any element containing "Magic Thumbnail" text to find the card,
+        # then grab the img inside it.
         thumb_web = page.evaluate("""() => {
-            const img = document.querySelector("img[src*='http']");
-            return img ? img.src : null;
+            // Find the element whose text includes 'Magic Thumbnail'
+            const allEls = Array.from(document.querySelectorAll('div,span,section,article'));
+            for (const el of allEls) {
+                if (!(el.innerText || '').includes('Magic Thumbnail')) continue;
+                // Walk up to find a container wide enough to be the card
+                let card = el;
+                for (let i = 0; i < 6; i++) {
+                    if (!card) break;
+                    const img = card.querySelector('img[src]');
+                    if (img && img.src && img.src.startsWith('http')
+                            && img.naturalWidth >= 100) {
+                        return img.src;
+                    }
+                    card = card.parentElement;
+                }
+            }
+            // Fallback: largest non-logo img on page
+            const imgs = Array.from(document.querySelectorAll('img[src]'))
+                .filter(img => img.src.startsWith('http')
+                    && !img.src.includes('logo')
+                    && !img.src.includes('avatar')
+                    && !img.src.includes('icon')
+                    && img.naturalWidth >= 300)
+                .sort((a, b) => (b.naturalWidth * b.naturalHeight) - (a.naturalWidth * a.naturalHeight));
+            return imgs.length ? imgs[0].src : null;
         }""") or ""
-        if thumb_web:
-            dest = os.path.join(local_folder, f"{safe_title}_thumbnail.jpg")
-            resp = requests.get(thumb_web, timeout=30)
-            with open(dest, "wb") as f:
-                f.write(resp.content)
-            thumb_local = dest
-            print(f"[Download] ✓ Thumbnail → {dest}")
+
+        # Step 2: click the Download button/link inside the Magic Thumbnail section
+        # Specifically look for a link with text "Download" that is NOT "Download video"
+        thumb_downloaded = False
+
+        # JS click approach: find visible Download link in the thumbnail section
+        js_thumb_dl = """() => {
+            const allEls = Array.from(document.querySelectorAll('div,span,section'));
+            for (const el of allEls) {
+                if (!(el.innerText || '').includes('Magic Thumbnail')) continue;
+                // Find 'Download' link/button inside this section
+                let card = el;
+                for (let i = 0; i < 6; i++) {
+                    if (!card) break;
+                    const dlBtns = Array.from(card.querySelectorAll('a,button,span,div'));
+                    for (const btn of dlBtns) {
+                        const t = (btn.innerText || btn.textContent || '').trim();
+                        const r = btn.getBoundingClientRect();
+                        // Match 'Download' but NOT 'Download video'
+                        if ((t === 'Download' || t === '\u2193 Download' || t.startsWith('Download')
+                                && !t.toLowerCase().includes('video'))
+                                && r.width > 0 && r.height > 0) {
+                            btn.click();
+                            return 'clicked:' + t;
+                        }
+                    }
+                    card = card.parentElement;
+                }
+            }
+            return null;
+        }"""
+        try:
+            with page.expect_download(timeout=20000) as dl_info:
+                result = page.evaluate(js_thumb_dl)
+            if result:
+                dl = dl_info.value
+                dl.save_as(dest)
+                thumb_local = dest
+                print(f"[Download] ✓ Thumbnail (native DL via JS click) → {dest}")
+                thumb_downloaded = True
+        except Exception as te:
+            print(f"[Download] Thumbnail native click failed: {te}")
+
+        # Step 3: if JS click didn't trigger a download, try requests with the img URL
+        if not thumb_downloaded and thumb_web:
+            try:
+                resp = requests.get(thumb_web, timeout=30, cookies=_cookies_dict(page),
+                                    headers={"Referer": page.url,
+                                             "User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200 and len(resp.content) > 5000:
+                    with open(dest, "wb") as f:
+                        f.write(resp.content)
+                    thumb_local = dest
+                    print(f"[Download] ✓ Thumbnail (requests) → {dest} ({len(resp.content)//1024} KB)")
+                else:
+                    print(f"[Download] Thumbnail HTTP {resp.status_code} / {len(resp.content)} bytes")
+            except Exception as re:
+                print(f"[Download] Thumbnail requests failed: {re}")
+
     except Exception as e:
-        print(f"[Download] Thumbnail failed: {e}")
+        print(f"[Download] Thumbnail outer error: {e}")
 
     # ── Download Video ────────────────────────────────────────────────────────
     video_local = ""
     try:
-        _ = wait_for_download_button(page, timeout=120)
-        print("[Download] Extracting video URL...")
-
-        video_url = page.evaluate("""() => {
-            const vid = document.querySelector("video");
-            if (vid && vid.src) return vid.src;
-            const src = document.querySelector("video source");
-            if (src && src.src) return src.src;
-            const a = document.querySelector("a[href*='.mp4']");
+        # Strategy 1: extract direct mp4 URL and download with session cookies
+        js_video_url = """() => {
+            // Direct <video src>
+            const vid = document.querySelector('video');
+            if (vid && vid.src && vid.src.includes('.mp4')) return vid.src;
+            // <video><source src>
+            const src = document.querySelector('video source');
+            if (src && src.src && src.src.includes('.mp4')) return src.src;
+            // Any <a href .mp4>
+            const a = document.querySelector('a[href*=".mp4"]');
             if (a && a.href) return a.href;
+            // Check data-src attributes
+            const dsrc = document.querySelector('[data-src*=".mp4"]');
+            if (dsrc) return dsrc.getAttribute('data-src');
+            // Scan all <source> tags
+            for (const s of document.querySelectorAll('source[src]')) {
+                if (s.src && s.src.includes('.mp4')) return s.src;
+            }
             return null;
-        }""")
+        }"""
 
-        if video_url:
-            print(f"[Download] ✓ Video URL found: {str(video_url)[:80]}...")
+        video_url = page.evaluate(js_video_url)
+        print(f"[Download] Video URL from DOM: {str(video_url)[:120] if video_url else 'NOT FOUND'}")
+
+        if not video_url:
+            # Strategy 2: click the Download button via Playwright native download
+            print("[Download] Attempting native Playwright download via button click...")
+            dl_selectors = [
+                "a[download]",
+                "a:has-text('Download')",
+                "button:has-text('Download')",
+                "[class*='download-btn']",
+                "[class*='download_btn']",
+                "[class*='export-btn']",
+                "a[href*='.mp4']",
+            ]
+            clicked_download = False
+            for sel in dl_selectors:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0 and loc.first.is_visible():
+                        dest = os.path.join(local_folder, f"{safe_title}.mp4")
+                        with page.expect_download(timeout=120000) as dl_info:
+                            loc.first.click()
+                        download = dl_info.value
+                        suggested = download.suggested_filename
+                        print(f"[Download] ✓ Native download started: {suggested}")
+                        if suggested and not suggested.lower().endswith('.mp4'):
+                            dest = os.path.join(local_folder, suggested)
+                        download.save_as(dest)
+                        video_local = dest
+                        print(f"[Download] ✓ Video saved → {dest}")
+                        clicked_download = True
+                        break
+                except Exception as dl_err:
+                    print(f"[Download] Native download via '{sel}' failed: {dl_err}")
+
+            if not clicked_download:
+                print("[Download] ❌ Could not trigger native download")
+                _dom_debug_buttons(page)
+
+        else:
             dest = os.path.join(local_folder, f"{safe_title}.mp4")
-
-            r = requests.get(video_url, stream=True, timeout=60)
+            print(f"[Download] Downloading via requests: {str(video_url)[:100]}")
+            hdrs = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": page.url,
+            }
+            r = requests.get(video_url, stream=True, timeout=120,
+                             cookies=_cookies_dict(page), headers=hdrs)
             r.raise_for_status()
+            total = 0
             with open(dest, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
+                for chunk in r.iter_content(chunk_size=65536):
                     if chunk:
                         f.write(chunk)
+                        total += len(chunk)
+            if total > 10_000:  # at least 10 KB
+                video_local = dest
+                print(f"[Download] ✓ Video saved → {dest} ({total // 1024} KB)")
+            else:
+                print(f"[Download] ❌ Downloaded only {total} bytes — file likely invalid")
+                os.remove(dest)
 
-            video_local = dest
-            print(f"[Download] ✓ Video saved → {dest}")
-        else:
-            print("[Download] ❌ No video URL found")
     except Exception as e:
         print(f"[Download] Video failed: {e}")
 
@@ -963,6 +1355,7 @@ def main():
 
                             # Resume from Storyboard/Generate path
                             step3_storyboard(page)
+                            step3b_edit_settings(page)
                             result = step4_generate_and_download(page, safe_title, safe_title)
 
                         else:
@@ -984,6 +1377,7 @@ def main():
 
                             step2_cast(page)
                             step3_storyboard(page)
+                            step3b_edit_settings(page)
                             result = step4_generate_and_download(page, safe_title, safe_title)
 
                         last_err = None
@@ -1038,20 +1432,22 @@ def main():
 
                 # ── Update Sheet with all results ─────────────────────────────
                 final_title = result["gen_title"] or title_hint
-                notes       = f"Generated OK | local: {result['local_folder']}"
+                video_ok    = bool(result["video_local"] and os.path.exists(result["video_local"]))
+                new_status  = "Done" if video_ok else "Failed"
+                notes       = f"{'Video OK' if video_ok else 'No video'} | local: {result['local_folder']}"
 
-                if result["video_local"]:
-                    sheet.update_cell(idx, COL_STATUS,      "Generated")
-                else:
-                    sheet.update_cell(idx, COL_STATUS,      "Failed")
-                sheet.update_cell(idx, COL_THUMB_URL,   drive_thumb_url or result["thumb_web"])
-                sheet.update_cell(idx, COL_VIDEO_ID,    result["video_id"])
-                sheet.update_cell(idx, COL_GEN_TITLE,   final_title)
-                sheet.update_cell(idx, COL_SUMMARY,     result["summary"])
-                sheet.update_cell(idx, COL_GEN_HASH,    result["hashtags"])
-                sheet.update_cell(idx, COL_NOTES,       notes)
-                sheet.update_cell(idx, COL_PROJECT_URL, page.url)
-                print(f"[Sheet] ✓ Row {idx} fully updated.")
+                try:
+                    sheet.update_cell(idx, COL_STATUS,      new_status)
+                    sheet.update_cell(idx, COL_THUMB_URL,   drive_thumb_url or result["thumb_web"])
+                    sheet.update_cell(idx, COL_VIDEO_ID,    result["video_id"])
+                    sheet.update_cell(idx, COL_GEN_TITLE,   final_title)
+                    sheet.update_cell(idx, COL_SUMMARY,     result["summary"])
+                    sheet.update_cell(idx, COL_GEN_HASH,    result["hashtags"])
+                    sheet.update_cell(idx, COL_NOTES,       notes)
+                    sheet.update_cell(idx, COL_PROJECT_URL, page.url)
+                    print(f"[Sheet] ✓ Row {idx} updated → Status: {new_status}")
+                except Exception as sheet_err:
+                    print(f"[Sheet] ❌ Failed to update row {idx}: {sheet_err}")
                 processed += 1
 
             except Exception as e:

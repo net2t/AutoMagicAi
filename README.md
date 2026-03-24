@@ -7,16 +7,16 @@ Automates AI video generation on [MagicLight.AI](https://magiclight.ai) — read
 ## Features
 
 - ✅ Cookie-based login (logs in once, reuses session on next runs)
-- ✅ Reads stories from a Google Sheet
-- ✅ Skips rows already marked **Generated**
+- ✅ Reads stories from a Google Sheet — processes rows with **Status = "Generated"**
 - ✅ Saves the **Project URL** to the sheet right after Step 1 (for retry)
 - ✅ Automatically retries using saved Project URL if a row is marked **Pending**
 - ✅ Navigates the full 4-step Kids Story generation flow
-- ✅ Selects: Pixar 2.0 style · 16:9 ratio · 1 min · English · GPT-4 · Ethan voice
-- ✅ Waits for video render (configurable — default 15 min)
-- ✅ Downloads **video** + **Magic Thumbnail** into a named local folder
-- ✅ Uploads both to **Google Drive** (per-story subfolder, same name)
-- ✅ Updates Google Sheet: Status, Magic Thumbnail URL, Video ID, Generated Title, Summary, Hashtags, Notes, Project URL
+- ✅ Step 1 selects: Pixar 2.0 style · 16:9 ratio · 1 min · English · GPT-4 · **Sophia voice** · **Silica background music**
+- ✅ Step 3b (Edit page): selects **Subtitle Style #10** from the Subtitle Settings tab
+- ✅ Waits for video render (configurable — default 15 min, reloads page every 2 min)
+- ✅ Downloads **video** + **Magic Thumbnail** (clicks the thumbnail Download button directly)
+- ✅ Uploads both to **Google Drive** (OAuth2 personal account or Service Account)
+- ✅ Updates Google Sheet: Status (`Done`/`Failed`), Magic Thumbnail URL, Video ID, Generated Title, Summary, Hashtags, Notes, Project URL
 - ✅ All timeouts configurable via `.env` — no code changes needed
 - ✅ Graceful CTRL+C shutdown
 
@@ -41,9 +41,10 @@ Automates AI video generation on [MagicLight.AI](https://magiclight.ai) — read
 | M | Notes | Processing notes |
 | N | Project URL | MagicLight edit URL (for retries) |
 
-- Rows where **Status = "Generated"** are **skipped**
+- Rows where **Status = "Generated"** are processed (generates video)
+- Rows where **Status = "Done"** are **skipped** (already completed)
 - Rows with empty **Story Text** are **skipped**
-- Rows with a **Project URL** and **Status ≠ Generated** are treated as retry jobs
+- Rows with a **Project URL** and **Status = "Pending"** are treated as retry jobs
 
 ---
 
@@ -56,12 +57,16 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 2. Google Service Account (Sheets + Drive access)
+### 2. Google Drive Access (choose one)
 
+**Option A — OAuth2 personal account (recommended):**
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a project → Enable **Google Sheets API** and **Google Drive API**
-3. Create a **Service Account** → Download JSON key → Save as `credentials.json`
-4. Share your Google Sheet and Drive folder with the service account email
+2. Create OAuth2 Desktop credentials → Download JSON → Save as `oauth_credentials.json`
+3. On first run a browser will open for Google sign-in — token is cached in `token.json`
+
+**Option B — Service Account:**
+1. Create a **Service Account** → Download JSON key → Save as `credentials.json`
+2. Share your Google Sheet and Drive folder with the service account email
 
 ### 3. Configure `.env`
 
@@ -139,6 +144,8 @@ The same folder structure is mirrored in Google Drive.
 AutoMagicAI/
 ├── main.py              # Main automation script
 ├── credentials.json     # Google Service Account key (DO NOT commit)
+├── oauth_credentials.json # OAuth2 credentials for Drive (DO NOT commit)
+├── token.json           # Cached OAuth2 token (auto-created, DO NOT commit)
 ├── .env                 # Your configuration (DO NOT commit)
 ├── .env.example         # Template for .env
 ├── cookies.json         # Saved login cookies (auto-created, DO NOT commit)
