@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# App runtime
+settings.json
+
+# Batch folders (user content)
+Pending/
+Done/
+
+# Local assets (do not commit)
+Input/
+
+# Video output files (don't commit processed videos)
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.flv
+*.wmv
+*.mp3
+*.wav
+*.aac
+*.exe
+*.zip
+
+# Bundled ffmpeg artifacts
+ffmpeg.zip
+ffmpeg_tool.exe
+
+# Temp / FFmpeg
+_tmp_*.mp4
+_merge_list.txt
+_concat.txt
+_intro_outro_list.txt
+
+# Logs
+*.log
