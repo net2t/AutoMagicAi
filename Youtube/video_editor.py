@@ -3693,6 +3693,101 @@ class VideoEditorApp(ctk.CTk):
 
 
 # ════════════════════════════════════════════════════════════════
+#  CLI BATCH PROCESSOR
+# ════════════════════════════════════════════════════════════════
+def run_cli_batch(limit=None):
+    load_settings()
+    if not FFMPEG_BIN:
+        print("[ERROR] FFmpeg Not Found! Install FFmpeg or pip install imageio-ffmpeg.")
+        return
+
+    pending = Path(SETTINGS.get("pending_dir", "E:/Pythons/Youtube/Pending"))
+    done = Path(SETTINGS.get("done_dir", "E:/Pythons/Youtube/Done"))
+    done.mkdir(parents=True, exist_ok=True)
+
+    if not pending.exists():
+        print(f"[CLI BATCH] Pending directory does not exist: {pending}")
+        return
+
+    files = [p for p in sorted(pending.iterdir())
+             if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
+    
+    if not files:
+        print(f"[CLI BATCH] No video files found in: {pending}")
+        return
+
+    if limit is not None and limit > 0:
+        files = files[:limit]
+        print(f"[CLI BATCH] Processing {limit} file(s) as requested limit.")
+
+    key = SETTINGS.get("main", {}).get("quality_profile", "3")
+    profile = YOUTUBE_PROFILES.get(key, YOUTUBE_PROFILES["3"])
+    
+    print(f"\n[CLI BATCH] Starting batch for {len(files)} file(s).")
+    
+    ok_count = 0
+    fail_count = 0
+    t0 = time.time()
+    
+    for i, src in enumerate(files):
+        print(f"\n[{i+1}/{len(files)}] Processing {src.name} ...")
+        try:
+            duration, has_audio = probe_duration_and_audio(src)
+            print(f"  ⏱ Duration: {format_duration(duration)} | Audio: {has_audio}")
+            
+            trim_end = SETTINGS.get("trim_end_seconds", 4.0) if SETTINGS.get("main", {}).get("trim_enabled", True) else 0.0
+            end_time = max(0.0, duration - trim_end) if duration > 0 else duration
+            
+            if SETTINGS.get("scene_threshold", 0) > 0 and end_time > 0:
+                print("  🔍 Detecting scene changes...")
+                scenes = detect_scene_changes(src, SETTINGS["scene_threshold"])
+                segments = build_segments(scenes, end_time, SETTINGS["min_scene_seconds"])
+                print(f"  🎬 Scenes found: {len(segments)}")
+            else:
+                segments = [(0.0, end_time or duration)]
+                print("  🎬 No scene detection — single segment")
+                
+            out_name = f"{src.stem}_{profile.height}p.mp4"
+            out_dir = done / src.stem
+            out_dir.mkdir(parents=True, exist_ok=True)
+            main_out = out_dir / out_name
+            
+            ending = Path(SETTINGS["ending"]["path"]) if SETTINGS["ending"]["enabled"] else None
+            use_ending = ending and ending.exists()
+            proc_out = out_dir / f"{src.stem}_{profile.height}p__main.mp4" if use_ending else main_out
+            
+            def progress(p):
+                pass
+                
+            print(f"  ⚙ Rendering with profile: {profile.label} | Trans: {SETTINGS.get('transitions') or ['fade']}")
+            ok, err = render_with_transitions(src, proc_out, profile, segments, has_audio, progress_cb=progress)
+            
+            if ok and use_ending:
+                print("  Appending ending video...")
+                ok2, err2 = concat_ending(proc_out, ending, main_out, profile)
+                try: proc_out.unlink()
+                except Exception: pass
+                if not ok2:
+                    ok, err = False, err2
+                    
+            if ok:
+                if SETTINGS.get("main", {}).get("delete_source", False):
+                    try: src.unlink()
+                    except Exception: pass
+                print(f"✅ Success -> {main_out}")
+                ok_count += 1
+            else:
+                print(f"❌ Failed to render: {err}")
+                fail_count += 1
+                
+        except Exception as e:
+            print(f"❌ Exception on {src.name}: {e}")
+            fail_count += 1
+    
+    elapsed = int(time.time() - t0)
+    print(f"\n✅ CLI Batch complete! Processed: {ok_count} | Failed: {fail_count} | Time: {elapsed}s")
+
+# ════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ════════════════════════════════════════════════════════════════
 if __name__ == "__main__":

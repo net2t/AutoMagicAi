@@ -1231,7 +1231,32 @@ def main():
     global browser_instance
 
     args  = parse_args()
-    limit = args.maxstory if args.maxstory is not None else STORIES_PER_RUN
+
+    print("=" * 60)
+    print("  AutoMagicAI — Main Menu")
+    print("  1: All video generation")
+    print("  2: Video Edit etc (No GUI)")
+    print("=" * 60)
+    
+    choice = input("Select an option (1 or 2): ").strip()
+    if choice not in ("1", "2"):
+        print("[ERROR] Invalid choice. Exiting.")
+        return
+
+    raw_limit = input("How many rows to proceed? (Leave blank for default): ").strip()
+    limit = int(raw_limit) if raw_limit.isdigit() else (args.maxstory if args.maxstory is not None else STORIES_PER_RUN)
+
+    if choice == "2":
+        try:
+            from Youtube.video_editor import run_cli_batch
+            run_cli_batch(limit=limit)
+        except ImportError as e:
+            print(f"[ERROR] Could not import Youtube.video_editor: {e}")
+        except Exception as e:
+            print(f"[ERROR] Batch edit failed: {e}")
+            import traceback
+            traceback.print_exc()
+        return
 
     print("=" * 60)
     print(f"  AutoMagicAI — MagicLight.AI Automation")
@@ -1448,7 +1473,6 @@ def main():
                     print(f"[Sheet] ✓ Row {idx} updated → Status: {new_status}")
                 except Exception as sheet_err:
                     print(f"[Sheet] ❌ Failed to update row {idx}: {sheet_err}")
-                processed += 1
 
             except Exception as e:
                 print(f"[ERROR] Row {idx} failed: {e}")
@@ -1457,6 +1481,9 @@ def main():
                     sheet.update_cell(idx, COL_NOTES,  str(e)[:500])
                 except Exception:
                     pass
+            
+            # Unconditionally increment processed count after attempting the row
+            processed += 1
 
         print(f"\n{'='*60}")
         print(f"  Done! Processed {processed}/{limit} stories.")
